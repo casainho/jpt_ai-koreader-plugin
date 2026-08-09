@@ -130,7 +130,7 @@ end
 
 function JPTAI:init()
     self.path = pluginDirectory()
-    local ok, config = pcall(dofile, self.path .. "jpt_config.lua")
+    local ok, config = pcall(dofile, self.path .. "jpt_ai_config.lua")
     self.config = ok and config or {}
     self.question_history_settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/jpt_ai.lua")
     self.question_history = self.question_history_settings:readSetting("question_history", {})
@@ -236,9 +236,9 @@ function JPTAI:formatRequestError(code, body, request_ok)
     local status = tonumber(code)
     local explanations = {
         [400] = _("The request was rejected. Check the endpoint, model, and request settings."),
-        [401] = _("Authentication failed. Check the API key in jpt_config.lua."),
+        [401] = _("Authentication failed. Check the API key in jpt_ai_config.lua."),
         [403] = _("The API key does not have permission to use this endpoint or model."),
-        [404] = _("The endpoint or model was not found. Check jpt_config.lua."),
+        [404] = _("The endpoint or model was not found. Check jpt_ai_config.lua."),
         [408] = _("The AI server took too long to answer. Try again or use less context."),
         [413] = _("The selected context is too large for the server. Use a page, chapter, or less nearby context."),
         [422] = _("The server could not process this request. Check the model and request settings."),

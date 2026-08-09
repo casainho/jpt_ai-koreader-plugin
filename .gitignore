@@ -1,5 +1,5 @@
 # Private API configuration. Keep this only on the development machine and Kobo.
-jpt_config.lua
+jpt_ai_config.lua
 
 # Local development artefacts.
 .DS_Store
