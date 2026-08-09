@@ -1,5 +1,5 @@
--- Copy this file to jpt_config.lua and enter your own values.
--- jpt_config.lua is intentionally ignored by Git.
+-- Copy this file to jpt_ai_config.lua and enter your own values.
+-- jpt_ai_config.lua is intentionally ignored by Git.
 return {
     base_url = "https://your-api-host.example/v1/chat/completions",
     api_key = "your-api-key",

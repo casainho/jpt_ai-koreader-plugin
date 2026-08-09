@@ -28,17 +28,17 @@ Your reading companion for KOReader: select any passage and ask AI to explain, s
 2. Create the private configuration file:
 
    ```sh
-   cp jpt_config.example.lua jpt_config.lua
+   cp jpt_ai_config.example.lua jpt_ai_config.lua
    ```
 
-3. Edit `jpt_config.lua` with your endpoint, API key, model, and preferred request settings.
+3. Edit `jpt_ai_config.lua` with your endpoint, API key, model, and preferred request settings.
 4. Restart KOReader.
 
-`jpt_config.lua` is deliberately excluded from Git, so your endpoint and API key remain local to your device.
+`jpt_ai_config.lua` is deliberately excluded from Git, so your endpoint and API key remain local to your device.
 
 ## Configuration
 
-`jpt_config.lua` has this shape:
+`jpt_ai_config.lua` has this shape:
 
 ```lua
 return {
@@ -51,7 +51,7 @@ return {
 }
 ```
 
-Use the URL required by your AI provider. Never commit `jpt_config.lua` or share its API key.
+Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or share its API key.
 
 ## Using the plugin
 
@@ -64,7 +64,7 @@ Question history is stored locally in KOReader settings and can be cleared from 
 
 ## Privacy
 
-The selected text and requested context are sent only to the endpoint configured in your private `jpt_config.lua`. The plugin does not include an endpoint or API key in this repository.
+The selected text and requested context are sent only to the endpoint configured in your private `jpt_ai_config.lua`. The plugin does not include an endpoint or API key in this repository.
 
 ## Compatibility
 
@@ -74,4 +74,4 @@ This plugin was tested on a **Kobo Clara BW (P365)** running KOReader. It is int
 
 - `main.lua` — plugin implementation.
 - `_meta.lua` — KOReader plugin metadata.
-- `jpt_config.example.lua` — safe private-configuration template.
+- `jpt_ai_config.example.lua` — safe private-configuration template.
