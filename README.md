@@ -2,6 +2,11 @@
 
 Your reading companion for KOReader: select any passage and ask AI to explain, summarize, translate, or discuss it in the context of the book.
 
+<p align="center">
+  <img src="plugin_01.jpg" alt="JPT AI question composer in KOReader" height="450" />
+  <img src="plugin_02.jpg" alt="JPT AI answer displayed in KOReader" height="450" />
+</p>
+
 ## Features
 
 - Ask free-form questions about the current page, chapter, book, or selected text.
