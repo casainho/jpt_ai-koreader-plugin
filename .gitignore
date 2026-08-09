@@ -1,0 +1,7 @@
+# Private API configuration. Keep this only on the development machine and Kobo.
+jpt_config.lua
+
+# Local development artefacts.
+.DS_Store
+__pycache__/
+*.pyc
