@@ -1,4 +1,6 @@
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local FrameContainer = require("ui/widget/container/framecontainer")
+local TopContainer = require("ui/widget/container/topcontainer")
 local ButtonTable = require("ui/widget/buttontable")
 local ButtonDialog = require("ui/widget/buttondialog")
 local InputDialog = require("ui/widget/inputdialog")
@@ -18,6 +20,8 @@ local json = require("json")
 local util = require("util")
 local _ = require("gettext")
 local logger = require("logger")
+local Blitbuffer = require("ffi/blitbuffer")
+local Geom = require("ui/geometry")
 
 local JPTAI = WidgetContainer:extend{ name = "jpt_ai", is_doc_only = true }
 
@@ -27,11 +31,14 @@ local CompactChatDialog = InputDialog:extend{}
 
 function CompactChatDialog:init()
     local title_face_fullscreen = TitleBar.title_face_fullscreen
+    local title_top_padding = TitleBar.title_top_padding
     local bottom_v_padding = TitleBar.bottom_v_padding
     TitleBar.title_face_fullscreen = Font:getFace("smalltfont", math.max(1, math.floor(title_face_fullscreen.orig_size * 0.66)))
+    TitleBar.title_top_padding = 0
     TitleBar.bottom_v_padding = math.floor(title_face_fullscreen.orig_size * 0.17)
     InputDialog.init(self)
     TitleBar.title_face_fullscreen = title_face_fullscreen
+    TitleBar.title_top_padding = title_top_padding
     TitleBar.bottom_v_padding = bottom_v_padding
 end
 
@@ -133,9 +140,17 @@ function JPTAI:init()
     local ok, config = pcall(dofile, self.path .. "jpt_ai_config.lua")
     self.config = ok and config or {}
     self.question_history_settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/jpt_ai.lua")
-    self.question_history = self.question_history_settings:readSetting("question_history", {})
     self.font_multiplier = tonumber(self.question_history_settings:readSetting("font_multiplier", 1.0)) or 1.0
     self.translation_language = self.question_history_settings:readSetting("translation_language", "Portuguese (Portugal)")
+    self.primary_context = self.question_history_settings:readSetting("primary_context", "pages")
+    self.secondary_context = self.question_history_settings:readSetting("secondary_context", "chapter")
+    local legacy_radius = self.question_history_settings:readSetting("page_radius", 1)
+    self.primary_page_count = math.max(1, tonumber(self.question_history_settings:readSetting("primary_page_count", 1)) or 1)
+    self.secondary_page_radius = math.max(0, tonumber(self.question_history_settings:readSetting("secondary_page_radius", legacy_radius)) or 1)
+    if self.primary_context == "chapter" and (self.secondary_context == "chapter" or self.secondary_context == "pages") then
+        self.secondary_context = "book"
+        self.question_history_settings:saveSetting("secondary_context", "book"):flush()
+    end
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self:registerDictionaryButton()
@@ -216,10 +231,7 @@ function JPTAI:getBookTextStyle(font_multiplier)
     local line_height = (tonumber(configurable.line_spacing) or 130) / 100
     local word_scaling = type(configurable.word_spacing) == "table" and tonumber(configurable.word_spacing[1]) or 100
     local word_spacing = (word_scaling - 100) / 400
-    -- MuPDF maps any CSS weight over 400 to the full bold face, unlike
-    -- CRengine's gradual font-weight control. Keep body text regular to avoid
-    -- making answers noticeably heavier than the book text.
-    local css = string.format("@page { margin: 0; } body { margin: 8px 0 0 0; line-height: %.2f; word-spacing: %.3fem; font-weight: normal; } p { margin: 0 0 0.7em 0; } table { border-collapse: collapse; } th { font-weight: bold; }", line_height, word_spacing)
+    local css = string.format("@page { margin: 0; } body { margin: 8px 0 0 0; line-height: %.2f; word-spacing: %.3fem; font-weight: normal; } p { margin: 0 0 0.7em 0; } hr { margin: 0; padding: 0; } .jpt-context { font-size: 80%%; margin: 0; padding: 0; text-align: left; } table { border-collapse: collapse; } th { font-weight: bold; }", line_height, word_spacing)
     local font_name = self.ui and self.ui.font and self.ui.font.font_face
     if not font_name or font_name == "" then return css, Device.screen:scaleBySize(font_size) end
 
@@ -292,99 +304,86 @@ function JPTAI:getDocument()
     return document, pages
 end
 
-function JPTAI:getContext(mode, nearby_pages)
+function JPTAI:getContext(primary_mode, secondary_mode)
     local selected = self:getSelectedText()
-    if selected and (mode == "minimum" or mode == "medium") then
-        return selected, "selected text", "[Context: Selected text]"
-    end
     local document, total = self:getDocument()
     if not document then return nil, total end
     local ok, text, label, response_heading = pcall(function()
-        local function heading(title, page_range)
-            local result = "[Context: " .. title .. "]"
-            if page_range then result = result .. "\n[Pages — " .. page_range .. "]" end
-            return result
-        end
         local function getPageRange(first, last)
             if first > last then return "" end
             if document.info.has_pages then return extractPdfText(document, first, last) end
             return document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""
         end
-        local function combine(primary_label, primary_text, secondary_label, secondary_text)
-            if not secondary_text or secondary_text == "" then return primary_text, primary_label end
-            return "[PRIMARY CONTEXT — " .. primary_label .. "]\n" .. primary_text
-                .. "\n\n[SECONDARY CONTEXT — " .. secondary_label .. "]\n" .. secondary_text,
-                primary_label .. " with " .. secondary_label
-        end
-        if mode == "maximum" or mode == "book" then
-            local book_heading = heading("Complete book")
-            if document.info.has_pages then
-                return book_heading .. "\n\n" .. extractPdfText(document, 1, total), "complete book", book_heading
-            end
-            local original = document:getXPointer()
-            document:gotoPos(0); local first = document:getXPointer()
-            document:gotoPage(total); local last = document:getXPointer()
-            if original then document:gotoXPointer(original) end
-            return book_heading .. "\n\n" .. (document:getTextFromXPointers(first, last) or ""), "complete book", book_heading
-        end
         local current = document.info.has_pages and (self.ui.view and self.ui.view.state.page or 1) or document:getPageFromXPointer(document:getXPointer())
-        if mode == "chapter" then
+        local function contextPart(mode, radius, is_secondary)
+            if mode == "book" then
+                local heading = "[Context: Complete book]"
+                if document.info.has_pages then return heading, extractPdfText(document, 1, total) end
+                local original = document:getXPointer()
+                document:gotoPos(0); local first = document:getXPointer()
+                document:gotoPage(total); local last = document:getXPointer()
+                if original then document:gotoXPointer(original) end
+                return heading, document:getTextFromXPointers(first, last) or ""
+            end
+            if mode == "chapter" then
             local toc = self.ui and self.ui.toc
             local chapter_error = _("KOReader could not identify the current chapter. Choose Page or Book instead.")
-            if not toc then return nil, chapter_error end
+            if not toc then return nil, nil, chapter_error end
             local title_ok, chapter_title = pcall(toc.getTocTitleByPage, toc, current)
-            if not title_ok or type(chapter_title) ~= "string" or not chapter_title:match("%S") then return nil, chapter_error end
+            if not title_ok or type(chapter_title) ~= "string" or not chapter_title:match("%S") then return nil, nil, chapter_error end
             local start_ok, is_start = pcall(toc.isChapterStart, toc, current)
-            if not start_ok then return nil, chapter_error end
+            if not start_ok then return nil, nil, chapter_error end
             local first = current
             if not is_start then
                 local previous_ok, previous = pcall(toc.getPreviousChapter, toc, current)
-                if not previous_ok then return nil, chapter_error end
+                if not previous_ok then return nil, nil, chapter_error end
                 first = previous
             end
-            if not first then return nil, chapter_error end
+            if not first then return nil, nil, chapter_error end
             local next_ok, next_chapter = pcall(toc.getNextChapter, toc, current)
-            if not next_ok then return nil, chapter_error end
+            if not next_ok then return nil, nil, chapter_error end
             local last = math.min(total, (next_chapter or (total + 1)) - 1)
-            local chapter_heading = "[Context: Chapter -- " .. chapter_title .. "]\n[Pages — " .. string.format("%d-%d", first, last) .. "]\n\n"
-            local response_heading = chapter_heading:gsub("\n+$", "")
-            if document.info.has_pages then return chapter_heading .. extractPdfText(document, first, last), "current chapter", response_heading end
-            return chapter_heading .. (document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""), "current chapter", response_heading
+                local heading = "[Context: Chapter -- " .. chapter_title .. "]\n[Pages — " .. string.format("%d-%d", first, last) .. "]"
+                if document.info.has_pages then return heading, extractPdfText(document, first, last) end
+                return heading, document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""
+            end
+            radius = radius or 1
+            if is_secondary and primary_mode == "pages" and not (selected and selected:match("%S")) then
+                local primary_radius = math.floor((self.primary_page_count - 1) / 2)
+                local before = getPageRange(math.max(1, current - primary_radius - radius), current - primary_radius - 1)
+                local after = getPageRange(current + primary_radius + 1, math.min(total, current + primary_radius + radius))
+                local additional = before ~= "" and after ~= "" and (before .. "\n\n" .. after) or (before ~= "" and before or after)
+                return "[Context: Additional pages -- " .. math.max(1, current - primary_radius - radius) .. "-" .. math.min(total, current + primary_radius + radius) .. "]", additional
+            end
+            local first, last = math.max(1, current - radius), math.min(total, current + radius)
+            return "[Context: Pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
         end
-        local radius = nearby_pages or (mode == "minimum" and 2 or 5)
-        local first, last = math.max(1, current - radius), math.min(total, current + radius)
-        if mode == "selected" then
-            if not selected then return nil, _("Select text before choosing the selected-text context.") end
-            return combine("selected text", selected, string.format("nearby pages (%d-%d)", first, last), getPageRange(first, last))
+        local primary_heading, primary_text, primary_error
+        if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor((self.primary_page_count - 1) / 2), false) end
+        if primary_error then return nil, primary_error end
+        local secondary_heading, secondary_text, secondary_error
+        if primary_mode ~= "book" then
+            secondary_heading, secondary_text, secondary_error = contextPart(secondary_mode, self.secondary_page_radius, true)
+            if secondary_error then return nil, secondary_error end
         end
-        if mode == "page" then
-            local secondary = getPageRange(first, current - 1)
-            local after = getPageRange(current + 1, last)
-            if after ~= "" then secondary = secondary == "" and after or secondary .. "\n\n" .. after end
-            local page_text, page_label = combine(string.format("current page (%d)", current), getPageRange(current, current), string.format("nearby pages (±%d)", radius), secondary)
-            return page_text, page_label, heading(string.format("Page -- %d", current))
+        local function contextLine(kind, heading)
+            local title = heading:match("^%[Context:%s*(.-)%]") or heading
+            return kind .. ": " .. title
         end
-        if document.info.has_pages then return extractPdfText(document, first, last), string.format("pages %d-%d", first, last) end
-        return document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or "", string.format("pages %d-%d", first, last)
+        local main_line = contextLine("Main context", primary_heading)
+        local context = main_line .. "\n\n" .. primary_text
+        local secondary_line
+        if secondary_heading and secondary_text and secondary_text ~= "" then
+            secondary_line = contextLine("Secondary context", secondary_heading)
+            context = context .. "\n\n" .. secondary_line .. "\n\n" .. secondary_text
+        end
+        local response_heading = '<div class="jpt-context">' .. htmlEscape(main_line)
+        if secondary_line then response_heading = response_heading .. "<br/>" .. htmlEscape(secondary_line) end
+        return context, "primary and secondary context", response_heading .. "</div>"
     end)
     text = ok and text and plainText(text) or text
     if not text or text == "" then return nil, _("KOReader could not extract text from this book.") end
     return text, label, response_heading
-end
-
-function JPTAI:rememberQuestion(question)
-    question = trim(question)
-    for index = #self.question_history, 1, -1 do
-        if self.question_history[index] == question then table.remove(self.question_history, index) end
-    end
-    table.insert(self.question_history, 1, question)
-    while #self.question_history > 20 do table.remove(self.question_history) end
-    self.question_history_settings:saveSetting("question_history", self.question_history):flush()
-end
-
-function JPTAI:clearQuestionHistory()
-    self.question_history = {}
-    self.question_history_settings:saveSetting("question_history", self.question_history):flush()
 end
 
 function JPTAI:setFontMultiplier(value)
@@ -395,6 +394,25 @@ end
 function JPTAI:setTranslationLanguage(language)
     self.translation_language = trim(language)
     self.question_history_settings:saveSetting("translation_language", self.translation_language):flush()
+end
+
+function JPTAI:setContext(kind, mode)
+    self[kind .. "_context"] = mode
+    self.question_history_settings:saveSetting(kind .. "_context", mode):flush()
+    if kind == "primary" and mode == "chapter" and (self.secondary_context == "chapter" or self.secondary_context == "pages") then
+        self.secondary_context = "book"
+        self.question_history_settings:saveSetting("secondary_context", "book"):flush()
+    end
+end
+
+function JPTAI:setPageRadius(kind, value)
+    if kind == "primary" then
+        self.primary_page_count = math.max(1, math.floor(tonumber(value) or 1))
+        self.question_history_settings:saveSetting("primary_page_count", self.primary_page_count):flush()
+        return
+    end
+    self[kind .. "_page_radius"] = math.max(kind == "secondary" and 0 or 1, math.floor(tonumber(value) or 1))
+    self.question_history_settings:saveSetting(kind .. "_page_radius", self[kind .. "_page_radius"]):flush()
 end
 
 function JPTAI:openTranslationLanguage(resume_composer)
@@ -450,80 +468,27 @@ function JPTAI:openComposerOptions(resume_composer)
                     self:openTranslationLanguage(resume_composer)
                 end },
             },
-            {
-                { text = _("Remove the historic"), font_bold = false, callback = function()
-                    self:clearQuestionHistory()
-                    resume()
-                end },
-            },
             {{ text = _("Close"), font_bold = false, callback = resume }},
         },
     }
     UIManager:show(options)
 end
 
-function JPTAI:openComposerContext(current_mode, current_radius, set_context, resume_composer)
-    local context
-    local function closeContext()
-        UIManager:close(context)
-        UIManager:nextTick(resume_composer)
-    end
-    local function selectContext(mode, radius)
-        set_context(mode, radius or current_radius)
-        closeContext()
-    end
-    context = ButtonDialog:new{
-        title = _("Context"),
-        use_info_style = false,
-        tap_close_callback = function() UIManager:nextTick(resume_composer) end,
-        buttons = {
-            {
-                { text = _("Main context"), align = "left", font_bold = true, callback = function() end },
-            },
-            {
-                { text = _("Selected text is used automatically when available."), align = "left", font_bold = false, callback = function() end },
-            },
-            {
-                { text = current_mode == "page" and "✓ " .. _("Page") or _("Page"), font_bold = false, callback = function() selectContext("page") end },
-                { text = current_mode == "chapter" and "✓ " .. _("Chapter") or _("Chapter"), font_bold = false, callback = function() selectContext("chapter") end },
-                { text = current_mode == "book" and "✓ " .. _("Book") or _("Book"), font_bold = false, callback = function() selectContext("book") end },
-            },
-            {
-                { text = _("Secondary context"), align = "left", font_bold = true, callback = function() end },
-            },
-            {
-                { text = current_radius == 1 and "✓ ±1 " .. _("page") or "±1 " .. _("page"), enabled = current_mode == "selected" or current_mode == "page", font_bold = false, callback = function() selectContext(current_mode, 1) end },
-                { text = current_radius == 3 and "✓ ±3 " .. _("pages") or "±3 " .. _("pages"), enabled = current_mode == "selected" or current_mode == "page", font_bold = false, callback = function() selectContext(current_mode, 3) end },
-                { text = current_radius == 10 and "✓ ±10 " .. _("pages") or "±10 " .. _("pages"), enabled = current_mode == "selected" or current_mode == "page", font_bold = false, callback = function() selectContext(current_mode, 10) end },
-            },
-            {{ text = _("Close"), font_bold = false, callback = closeContext }},
-        },
-    }
-    UIManager:show(context)
-end
-
-function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, cursor_charpos, nearby_pages)
+function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, cursor_charpos, secondary_mode)
     local composer
     local default_button_sep_width = ButtonTable.sep_width
-    local selected_mode = mode == "selected" and "selected" or mode == "chapter" and "chapter" or (mode == "maximum" or mode == "book") and "book" or (self:getSelectedText() and "selected" or "page")
-    local selected_radius = nearby_pages or (mode == "medium" and 3 or 1)
-    local function submitQuestion(asked, remember_question)
+    local selected_mode = mode == "chapter" and "chapter" or (mode == "maximum" or mode == "book") and "book" or self.primary_context
+    local selected_secondary = secondary_mode or self.secondary_context
+    local function submitQuestion(asked)
         UIManager:close(composer)
         if asked and asked:match("%S") then
             local selected = self:getSelectedText()
             local display_question = asked
-            if selected_mode == "selected" and selected and selected:match("%S") then
+            if selected and selected:match("%S") then
                 display_question = selected .. "\n\n" .. asked
             end
-            if remember_question then
-                local history_question = asked
-                if selected and asked:sub(1, #selected) == selected then
-                    history_question = trim(asked:sub(#selected + 1))
-                end
-                if history_question:match("%S") then self:rememberQuestion(history_question) end
-            end
-            local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_radius)
-            self:sendQuestion(asked, selected_mode, waiting, selected_radius, display_question)
+            local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_secondary)
+            self:sendQuestion(asked, selected_mode, waiting, selected_secondary, display_question)
         end
     end
     ButtonTable.sep_width = default_button_sep_width * 2
@@ -533,19 +498,9 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         condensed = true, allow_newline = true,
         buttons = {
             {
-                { text = _("Explain"), callback = function() submitQuestion("Explain the text clearly and concisely.", false) end },
-                { text = _("Summarize"), callback = function() submitQuestion("Summarize the selected text, preserving the main ideas and important details.", false) end },
-                { text = _("Translate"), callback = function() submitQuestion("Translate the selected text into " .. self.translation_language .. ", preserving its meaning and tone.", false) end },
-                { text = _("Context"), callback = function()
-                    local draft = composer:getInputText()
-                    local cursor = composer._input_widget.charpos
-                    UIManager:close(composer)
-                    self:openComposerContext(selected_mode, selected_radius, function(mode, radius)
-                        selected_mode, selected_radius = mode, radius
-                    end, function()
-                        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_radius)
-                    end)
-                end },
+                { text = _("Explain"), callback = function() submitQuestion("Explain the text clearly and concisely.") end },
+                { text = _("Summarize"), callback = function() submitQuestion("Summarize the selected text, preserving the main ideas and important details.") end },
+                { text = _("Translate"), callback = function() submitQuestion("Translate the selected text into " .. self.translation_language .. ", preserving its meaning and tone.") end },
             },
             {
                 { text = _("Close"), callback = function()
@@ -557,11 +512,11 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                     local cursor = composer._input_widget.charpos
                     UIManager:close(composer)
                     self:openComposerOptions(function()
-                        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_radius)
+                        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_secondary)
                     end)
                 end },
                 { text = _("Ask"), is_enter_default = true, callback = function()
-                    submitQuestion(composer:getInputText(), true)
+                    submitQuestion(composer:getInputText())
                 end },
             },
         },
@@ -571,19 +526,35 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         composer._input_widget.charpos = cursor_charpos
         composer._input_widget:initTextBox(composer._input_widget.text)
     end
-    local history_buttons = {}
-    for index = 1, math.min(#self.question_history, 4) do
-        local previous_question = self.question_history[index]
-        table.insert(history_buttons, {{
-            text = previous_question,
-            callback = function() composer:setInputText(previous_question, true, false) end,
-        }})
+    local function addContextButtons(kind, title)
+        local current = self[kind .. "_context"]
+        local radius = kind == "primary" and self.primary_page_count or self.secondary_page_radius
+        local secondary_disabled = kind == "secondary" and self.primary_context == "book"
+        local chapter_disabled = secondary_disabled or (kind == "secondary" and self.primary_context == "chapter")
+        local pages_disabled = secondary_disabled or (kind == "secondary" and self.primary_context == "chapter")
+        composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {{
+            { text = title, align = "left", font_bold = true, callback = function() end },
+        }, {
+            { text = (current == "pages" and "✓ " or "") .. (kind == "primary" and "Pages (" or "± Pages (") .. radius .. ")", enabled = not pages_disabled, callback = function()
+                local draft, cursor = composer:getInputText(), composer._input_widget.charpos
+                self:setContext(kind, "pages")
+                UIManager:close(composer)
+                UIManager:show(SpinWidget:new{
+                    title_text = kind == "primary" and _("Pages in the primary context") or _("Additional pages on each side"),
+                    info_text = kind == "primary" and _("Choose an odd total: 1, 3, 5, and so on.") or _("Pages included before and after the current page."),
+                    value = radius, value_min = kind == "primary" and 1 or 0, value_max = kind == "primary" and 21 or 20, value_step = kind == "primary" and 2 or 1, value_hold_step = kind == "primary" and 2 or 1, precision = "%d",
+                    callback = function(spin)
+                        self:setPageRadius(kind, spin.value)
+                        self:openComposer(nil, response, question, chat_dialog, draft, cursor)
+                    end,
+                })
+            end },
+            { text = current == "chapter" and "✓ Chapter" or "Chapter", enabled = not chapter_disabled, callback = function() self:setContext(kind, "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+            { text = current == "book" and "✓ Book" or "Book", enabled = not secondary_disabled, callback = function() self:setContext(kind, "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+        }}, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
     end
-    if #history_buttons > 0 then
-        composer:addWidget(ButtonTable:new{
-            width = composer:getAddedWidgetAvailableWidth(), buttons = history_buttons, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer,
-        })
-    end
+    addContextButtons("primary", _("PRIMARY CONTEXT"))
+    addContextButtons("secondary", _("SECONDARY CONTEXT"))
     UIManager:show(composer)
     composer:onShowKeyboard()
 end
@@ -593,13 +564,8 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     input_hidden = true
     local screen, dialog = Device.screen, nil
     local width = math.floor(screen:getWidth() * 0.94)
-    local markdown = question and ("**Question:**  \n" .. question .. "\n\n---\n\n" .. response) or response
+    local markdown = question and ("**Question:**  \n" .. question .. "\n\n---\n" .. response) or response
     local css, font_size = self:getBookTextStyle(self.font_multiplier)
-    local output = ScrollHtmlWidget:new{
-        html_body = renderMarkdown(markdown), width = width, height = math.floor(screen:getHeight() * (input_hidden and 0.86 or 0.65)), dialog = nil,
-        default_font_size = font_size,
-        css = css,
-    }
     dialog = CompactChatDialog:new{
         title = "JPT AI - " .. self:getBookTitle(), input = input_text or "", input_hint = _("Write your question here"),
         fullscreen = true, condensed = true, allow_newline = true, keyboard_visible = false,
@@ -607,6 +573,20 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
             { text = _("Close"), width = math.floor(width / 2), callback = function() UIManager:close(dialog) end },
             { text = _("Ask"), width = math.floor(width / 2), callback = function() self:openComposer("page", response, question, dialog, nil, nil, nearby_pages) end },
         }},
+    }
+    local output = ScrollHtmlWidget:new{
+        html_body = renderMarkdown(markdown), width = width,
+        height = screen:getHeight() - dialog.title_bar:getSize().h - dialog.button_table:getSize().h,
+        dialog = nil, default_font_size = font_size, css = css,
+    }
+    dialog[1] = FrameContainer:new{
+        width = screen:getWidth(), height = screen:getHeight(),
+        padding = 0, margin = 0, bordersize = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        TopContainer:new{
+            dimen = Geom:new{ w = screen:getWidth(), h = screen:getHeight() },
+            dialog.dialog_frame,
+        },
     }
     output.dialog = dialog
     dialog:addWidget(output)
@@ -618,7 +598,14 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     dialog.onSwitchFocus = function()
         if not input_hidden then UIManager:nextTick(function() self:openComposer("page", response, question, dialog, nil, nil, nearby_pages) end) end
     end
-    UIManager:show(dialog)
+    -- The dialog is fullscreen, but InputDialog normally asks KOReader to
+    -- refresh only its content-sized frame. Force a complete e-ink repaint so
+    -- no pixels from the preceding window remain at the top of the screen.
+    dialog.onShow = function()
+        Device.screen:clear()
+        UIManager:setDirty("all", "full")
+    end
+    UIManager:show(dialog, "full")
     if not input_hidden then dialog:lockKeyboard(true) end
     return dialog
 end
