@@ -138,6 +138,7 @@ function JPTAI:init()
     self.translation_language = self.question_history_settings:readSetting("translation_language", "Portuguese (Portugal)")
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
+    self:registerDictionaryButton()
     if self.ui.highlight then
         self.ui.highlight:addToHighlightDialog("08a_jpt_ai", function(this)
             return {
@@ -152,6 +153,25 @@ function JPTAI:init()
             }
         end)
     end
+end
+
+-- A normal long press on a single word opens KOReader's dictionary directly,
+-- bypassing the multi-word highlight menu. Add an action there as well.
+function JPTAI:registerDictionaryButton()
+    if not (self.ui and self.ui.dictionary) then return end
+    self.ui.dictionary:addToDictButtons({
+        id = "jpt_ai",
+        text = "JPT AI",
+        conditional = true,
+        callback = function(dict_popup)
+            local selected = util.cleanupSelectedText(dict_popup.lookupword or dict_popup.word or "")
+            if not selected:match("%S") then return end
+            dict_popup:onClose()
+            self.pending_selected_text = selected
+            local selected_chars = util.splitToChars(selected)
+            self:openComposer("minimum", nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
+        end,
+    })
 end
 
 function JPTAI:onDispatcherRegisterActions()
@@ -274,10 +294,17 @@ end
 
 function JPTAI:getContext(mode, nearby_pages)
     local selected = self:getSelectedText()
-    if selected and (mode == "minimum" or mode == "medium") then return selected, "selected text" end
+    if selected and (mode == "minimum" or mode == "medium") then
+        return selected, "selected text", "[Context: Selected text]"
+    end
     local document, total = self:getDocument()
     if not document then return nil, total end
-    local ok, text, label = pcall(function()
+    local ok, text, label, response_heading = pcall(function()
+        local function heading(title, page_range)
+            local result = "[Context: " .. title .. "]"
+            if page_range then result = result .. "\n[Pages — " .. page_range .. "]" end
+            return result
+        end
         local function getPageRange(first, last)
             if first > last then return "" end
             if document.info.has_pages then return extractPdfText(document, first, last) end
@@ -290,21 +317,39 @@ function JPTAI:getContext(mode, nearby_pages)
                 primary_label .. " with " .. secondary_label
         end
         if mode == "maximum" or mode == "book" then
-            if document.info.has_pages then return extractPdfText(document, 1, total), "complete book" end
+            local book_heading = heading("Complete book")
+            if document.info.has_pages then
+                return book_heading .. "\n\n" .. extractPdfText(document, 1, total), "complete book", book_heading
+            end
             local original = document:getXPointer()
             document:gotoPos(0); local first = document:getXPointer()
             document:gotoPage(total); local last = document:getXPointer()
             if original then document:gotoXPointer(original) end
-            return document:getTextFromXPointers(first, last) or "", "complete book"
+            return book_heading .. "\n\n" .. (document:getTextFromXPointers(first, last) or ""), "complete book", book_heading
         end
         local current = document.info.has_pages and (self.ui.view and self.ui.view.state.page or 1) or document:getPageFromXPointer(document:getXPointer())
         if mode == "chapter" then
             local toc = self.ui and self.ui.toc
-            local first = toc and (toc:isChapterStart(current) and current or toc:getPreviousChapter(current)) or 1
-            local next_chapter = toc and toc:getNextChapter(current)
+            local chapter_error = _("KOReader could not identify the current chapter. Choose Page or Book instead.")
+            if not toc then return nil, chapter_error end
+            local title_ok, chapter_title = pcall(toc.getTocTitleByPage, toc, current)
+            if not title_ok or type(chapter_title) ~= "string" or not chapter_title:match("%S") then return nil, chapter_error end
+            local start_ok, is_start = pcall(toc.isChapterStart, toc, current)
+            if not start_ok then return nil, chapter_error end
+            local first = current
+            if not is_start then
+                local previous_ok, previous = pcall(toc.getPreviousChapter, toc, current)
+                if not previous_ok then return nil, chapter_error end
+                first = previous
+            end
+            if not first then return nil, chapter_error end
+            local next_ok, next_chapter = pcall(toc.getNextChapter, toc, current)
+            if not next_ok then return nil, chapter_error end
             local last = math.min(total, (next_chapter or (total + 1)) - 1)
-            if document.info.has_pages then return extractPdfText(document, first, last), "current chapter" end
-            return document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or "", "current chapter"
+            local chapter_heading = "[Context: Chapter -- " .. chapter_title .. "]\n[Pages — " .. string.format("%d-%d", first, last) .. "]\n\n"
+            local response_heading = chapter_heading:gsub("\n+$", "")
+            if document.info.has_pages then return chapter_heading .. extractPdfText(document, first, last), "current chapter", response_heading end
+            return chapter_heading .. (document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""), "current chapter", response_heading
         end
         local radius = nearby_pages or (mode == "minimum" and 2 or 5)
         local first, last = math.max(1, current - radius), math.min(total, current + radius)
@@ -316,14 +361,15 @@ function JPTAI:getContext(mode, nearby_pages)
             local secondary = getPageRange(first, current - 1)
             local after = getPageRange(current + 1, last)
             if after ~= "" then secondary = secondary == "" and after or secondary .. "\n\n" .. after end
-            return combine("current page", getPageRange(current, current), string.format("nearby pages (±%d)", radius), secondary)
+            local page_text, page_label = combine(string.format("current page (%d)", current), getPageRange(current, current), string.format("nearby pages (±%d)", radius), secondary)
+            return page_text, page_label, heading(string.format("Page -- %d", current))
         end
         if document.info.has_pages then return extractPdfText(document, first, last), string.format("pages %d-%d", first, last) end
         return document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or "", string.format("pages %d-%d", first, last)
     end)
     text = ok and text and plainText(text) or text
     if not text or text == "" then return nil, _("KOReader could not extract text from this book.") end
-    return text, label
+    return text, label, response_heading
 end
 
 function JPTAI:rememberQuestion(question)
@@ -581,7 +627,7 @@ function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_q
     display_question = display_question or question
     local connection, error_message = self:loadConnection()
     if not connection then self:openChat(mode, error_message, display_question, chat_dialog, nil, nil, nearby_pages); return end
-    local context, label = self:getContext(mode, nearby_pages)
+    local context, label, response_heading = self:getContext(mode, nearby_pages)
     self.pending_selected_text = nil
     if not context then self:openChat(mode, label, display_question, chat_dialog, nil, nil, nearby_pages); return end
     UIManager:nextTick(function()
@@ -597,7 +643,9 @@ function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_q
         end
         local ok, decoded = pcall(json.decode, body)
         local answer = ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
-        self:openChat(mode, answer or _("JPT AI received no readable response."), display_question, chat_dialog, nil, nil, nearby_pages)
+        answer = answer or _("JPT AI received no readable response.")
+        if response_heading then answer = response_heading .. "\n\n" .. answer end
+        self:openChat(mode, answer, display_question, chat_dialog, nil, nil, nearby_pages)
     end)
 end
 
