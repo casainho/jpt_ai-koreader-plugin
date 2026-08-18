@@ -11,8 +11,8 @@ Your reading companion for KOReader: select any passage and ask AI to explain, s
 
 - Ask free-form questions about the current page, chapter, book, or selected text.
 - Explain, summarize, and translate selected passages with one tap.
-- Choose how much surrounding context is sent with a question.
-- Keep a small, local history of previous questions.
+- Pick the primary and secondary reading contexts directly in the question dialog.
+- Remember the chosen primary and secondary contexts for the next question.
 - Adjust response font size and translation language from the plugin options.
 - Send requests to an AI chat-completions endpoint that you configure yourself.
 
@@ -58,9 +58,7 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 - Open **JPT AI** from KOReader's tools menu or bind its `Open JPT AI` action to a gesture.
 - Select text in a book and choose **JPT AI** from the selection menu.
 - Use **Explain**, **Summarize**, or **Translate** for a quick response, or write a custom question.
-- In **Context**, choose whether the request should include a page, chapter, book, or nearby pages.
-
-Question history is stored locally in KOReader settings and can be cleared from **Options** with **Remove the historic**.
+- Use the **PRIMARY CONTEXT** and **SECONDARY CONTEXT** buttons to choose nearby pages, the current chapter, or the complete book. Primary **Pages (n)** uses an odd total (1, 3, 5, ...); secondary pages have their own saved setting and add text outside the primary page range. A chapter cannot use a second chapter, and a complete book disables the secondary context.
 
 ## Privacy
 
