@@ -13,7 +13,7 @@ Your reading companion for KOReader: select any passage and ask AI to explain, s
 - Explain, summarize, and translate selected passages with one tap.
 - Pick the primary and secondary reading contexts directly in the question dialog.
 - Remember the chosen primary and secondary contexts for the next question.
-- Adjust response font size and translation language from the plugin options.
+- Adjust response font size, translation language, and response length from the plugin options. Choose **Short**, **Medium**, **Long**, or **Very long**; the setting is remembered for future questions.
 - Send requests to an AI chat-completions endpoint that you configure yourself.
 
 ## Requirements
@@ -46,7 +46,8 @@ return {
     api_key = "your-api-key",
     model = "your-model-name",
     temperature = 0.2,
-    max_output_tokens = 8192,
+    max_output_tokens = 12000,
+    request_timeout = 180,
     reasoning_effort = "low",
 }
 ```
@@ -58,7 +59,7 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 - Open **JPT AI** from KOReader's tools menu or bind its `Open JPT AI` action to a gesture.
 - Select text in a book and choose **JPT AI** from the selection menu.
 - Use **Explain**, **Summarize**, or **Translate** for a quick response, or write a custom question.
-- Use the **PRIMARY CONTEXT** and **SECONDARY CONTEXT** buttons to choose nearby pages, the current chapter, or the complete book. Primary **Pages (n)** uses an odd total (1, 3, 5, ...); secondary pages have their own saved setting and add text outside the primary page range. A chapter cannot use a second chapter, and a complete book disables the secondary context.
+- Use the **PRIMARY CONTEXT** and **SECONDARY CONTEXT** buttons to choose nearby pages, the current chapter, or the complete book. Primary **Pages (n)** uses an odd total (1, 3, 5, ...); secondary pages have their own saved setting and add text outside the primary page range. Tap the selected secondary option again to turn it off, so no secondary context is sent. A chapter cannot use a second chapter, and a complete book disables the secondary context.
 
 ## Privacy
 

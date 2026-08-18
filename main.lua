@@ -25,6 +25,13 @@ local Geom = require("ui/geometry")
 
 local JPTAI = WidgetContainer:extend{ name = "jpt_ai", is_doc_only = true }
 
+local response_lengths = {
+    short = { label = _("Short"), max_tokens = 1024, instruction = "Keep the answer concise: one short paragraph or a compact list." },
+    medium = { label = _("Medium"), max_tokens = 2500, instruction = "Give a well-developed answer with the relevant explanation and details." },
+    long = { label = _("Long"), max_tokens = 7500, instruction = "Give a detailed, thorough answer. Develop the reasoning and include useful examples or structure when appropriate." },
+    very_long = { label = _("Very long"), max_tokens = 12000, instruction = "Give a very detailed and comprehensive answer. Cover the relevant nuances, reasoning, and examples; do not unnecessarily abbreviate the response." },
+}
+
 -- InputDialog does not expose title-bar styling. Keep this scoped to the chat
 -- dialog, including any later reinitialization caused by a screen rotation.
 local CompactChatDialog = InputDialog:extend{}
@@ -142,15 +149,13 @@ function JPTAI:init()
     self.question_history_settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/jpt_ai.lua")
     self.font_multiplier = tonumber(self.question_history_settings:readSetting("font_multiplier", 1.0)) or 1.0
     self.translation_language = self.question_history_settings:readSetting("translation_language", "Portuguese (Portugal)")
+    self.response_length = self.question_history_settings:readSetting("response_length", "medium")
+    if not response_lengths[self.response_length] then self.response_length = "medium" end
     self.primary_context = self.question_history_settings:readSetting("primary_context", "pages")
     self.secondary_context = self.question_history_settings:readSetting("secondary_context", "chapter")
     local legacy_radius = self.question_history_settings:readSetting("page_radius", 1)
     self.primary_page_count = math.max(1, tonumber(self.question_history_settings:readSetting("primary_page_count", 1)) or 1)
     self.secondary_page_radius = math.max(0, tonumber(self.question_history_settings:readSetting("secondary_page_radius", legacy_radius)) or 1)
-    if self.primary_context == "chapter" and (self.secondary_context == "chapter" or self.secondary_context == "pages") then
-        self.secondary_context = "book"
-        self.question_history_settings:saveSetting("secondary_context", "book"):flush()
-    end
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self:registerDictionaryButton()
@@ -286,7 +291,9 @@ function JPTAI:formatRequestError(code, body, request_ok)
     end
     if not explanation then
         local lower_original = original:lower()
-        if lower_original:find("timeout", 1, true) then
+        if lower_original:find("wantread", 1, true) then
+            explanation = _("The secure connection is still waiting for the AI service. Keep Wi-Fi connected and try again.")
+        elseif lower_original:find("timeout", 1, true) then
             explanation = _("The network request timed out. Check the connection and try again.")
         elseif lower_original:find("certificate", 1, true) or lower_original:find("ssl", 1, true) then
             explanation = _("A secure connection could not be established. Check the endpoint URL and device time.")
@@ -362,7 +369,7 @@ function JPTAI:getContext(primary_mode, secondary_mode)
         if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor((self.primary_page_count - 1) / 2), false) end
         if primary_error then return nil, primary_error end
         local secondary_heading, secondary_text, secondary_error
-        if primary_mode ~= "book" then
+        if primary_mode ~= "book" and secondary_mode and secondary_mode ~= "none" then
             secondary_heading, secondary_text, secondary_error = contextPart(secondary_mode, self.secondary_page_radius, true)
             if secondary_error then return nil, secondary_error end
         end
@@ -396,13 +403,15 @@ function JPTAI:setTranslationLanguage(language)
     self.question_history_settings:saveSetting("translation_language", self.translation_language):flush()
 end
 
+function JPTAI:setResponseLength(length)
+    if not response_lengths[length] then return end
+    self.response_length = length
+    self.question_history_settings:saveSetting("response_length", length):flush()
+end
+
 function JPTAI:setContext(kind, mode)
     self[kind .. "_context"] = mode
     self.question_history_settings:saveSetting(kind .. "_context", mode):flush()
-    if kind == "primary" and mode == "chapter" and (self.secondary_context == "chapter" or self.secondary_context == "pages") then
-        self.secondary_context = "book"
-        self.question_history_settings:saveSetting("secondary_context", "book"):flush()
-    end
 end
 
 function JPTAI:setPageRadius(kind, value)
@@ -438,6 +447,35 @@ function JPTAI:openTranslationLanguage(resume_composer)
     dialog:onShowKeyboard()
 end
 
+function JPTAI:openResponseLengthOptions(resume_composer)
+    local selector
+    local function resume()
+        UIManager:close(selector)
+        UIManager:nextTick(resume_composer)
+    end
+    local function choose(length)
+        self:setResponseLength(length)
+        resume()
+    end
+    selector = ButtonDialog:new{
+        title = _("Response length"),
+        use_info_style = false,
+        tap_close_callback = function() UIManager:nextTick(resume_composer) end,
+        buttons = {
+            {
+                { text = self.response_length == "short" and "✓ " .. _("Short") or _("Short"), callback = function() choose("short") end },
+                { text = self.response_length == "medium" and "✓ " .. _("Medium") or _("Medium"), callback = function() choose("medium") end },
+            },
+            {
+                { text = self.response_length == "long" and "✓ " .. _("Long") or _("Long"), callback = function() choose("long") end },
+                { text = self.response_length == "very_long" and "✓ " .. _("Very long") or _("Very long"), callback = function() choose("very_long") end },
+            },
+            {{ text = _("Close"), font_bold = false, callback = resume }},
+        },
+    }
+    UIManager:show(selector)
+end
+
 function JPTAI:openComposerOptions(resume_composer)
     local options
     local function resume()
@@ -466,6 +504,12 @@ function JPTAI:openComposerOptions(resume_composer)
                 { text = _("Translation language"), font_bold = false, callback = function()
                     UIManager:close(options)
                     self:openTranslationLanguage(resume_composer)
+                end },
+            },
+            {
+                { text = _("Response length") .. ": " .. response_lengths[self.response_length].label, font_bold = false, callback = function()
+                    UIManager:close(options)
+                    self:openResponseLengthOptions(resume_composer)
                 end },
             },
             {{ text = _("Close"), font_bold = false, callback = resume }},
@@ -537,6 +581,12 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         }, {
             { text = (current == "pages" and "✓ " or "") .. (kind == "primary" and "Pages (" or "± Pages (") .. radius .. ")", enabled = not pages_disabled, callback = function()
                 local draft, cursor = composer:getInputText(), composer._input_widget.charpos
+                if kind == "secondary" and current == "pages" then
+                    self:setContext(kind, "none")
+                    UIManager:close(composer)
+                    self:openComposer(nil, response, question, chat_dialog, draft, cursor)
+                    return
+                end
                 self:setContext(kind, "pages")
                 UIManager:close(composer)
                 UIManager:show(SpinWidget:new{
@@ -545,12 +595,14 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                     value = radius, value_min = kind == "primary" and 1 or 0, value_max = kind == "primary" and 21 or 20, value_step = kind == "primary" and 2 or 1, value_hold_step = kind == "primary" and 2 or 1, precision = "%d",
                     callback = function(spin)
                         self:setPageRadius(kind, spin.value)
+                    end,
+                    close_callback = function()
                         self:openComposer(nil, response, question, chat_dialog, draft, cursor)
                     end,
                 })
             end },
-            { text = current == "chapter" and "✓ Chapter" or "Chapter", enabled = not chapter_disabled, callback = function() self:setContext(kind, "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
-            { text = current == "book" and "✓ Book" or "Book", enabled = not secondary_disabled, callback = function() self:setContext(kind, "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+            { text = current == "chapter" and "✓ Chapter" or "Chapter", enabled = not chapter_disabled, callback = function() self:setContext(kind, kind == "secondary" and current == "chapter" and "none" or "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+            { text = current == "book" and "✓ Book" or "Book", enabled = not secondary_disabled, callback = function() self:setContext(kind, kind == "secondary" and current == "book" and "none" or "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
         }}, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
     end
     addContextButtons("primary", _("PRIMARY CONTEXT"))
@@ -562,10 +614,19 @@ end
 function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages)
     if previous_dialog then UIManager:close(previous_dialog) end
     input_hidden = true
+    if type(response) ~= "string" then response = tostring(response or "") end
+    if type(question) ~= "string" then question = nil end
     local screen, dialog = Device.screen, nil
     local width = math.floor(screen:getWidth() * 0.94)
     local markdown = question and ("**Question:**  \n" .. question .. "\n\n---\n" .. response) or response
     local css, font_size = self:getBookTextStyle(self.font_multiplier)
+    -- A malformed Markdown response must not close KOReader while the answer
+    -- dialog is being built. Fall back to escaped plain text in that case.
+    local rendered_ok, html_body = pcall(renderMarkdown, markdown)
+    if not rendered_ok or type(html_body) ~= "string" then
+        logger.warn("JPT AI could not render the response as Markdown:", tostring(html_body))
+        html_body = "<pre>" .. htmlEscape(markdown) .. "</pre>"
+    end
     dialog = CompactChatDialog:new{
         title = "JPT AI - " .. self:getBookTitle(), input = input_text or "", input_hint = _("Write your question here"),
         fullscreen = true, condensed = true, allow_newline = true, keyboard_visible = false,
@@ -575,7 +636,7 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
         }},
     }
     local output = ScrollHtmlWidget:new{
-        html_body = renderMarkdown(markdown), width = width,
+        html_body = html_body, width = width,
         height = screen:getHeight() - dialog.title_bar:getSize().h - dialog.button_table:getSize().h,
         dialog = nil, default_font_size = font_size, css = css,
     }
@@ -618,8 +679,11 @@ function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_q
     self.pending_selected_text = nil
     if not context then self:openChat(mode, label, display_question, chat_dialog, nil, nil, nearby_pages); return end
     UIManager:nextTick(function()
-        local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = self.config.max_output_tokens or 8192, reasoning_effort = self.config.reasoning_effort or "low",
-            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context." }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. "\n\nQUESTION:\n" .. question }} })
+        local response_length = response_lengths[self.response_length] or response_lengths.medium
+        local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
+        https.TIMEOUT = math.max(60, tonumber(self.config.request_timeout) or 180)
+        local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low",
+            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. "\n\nQUESTION:\n" .. question }} })
         local response = {}
         local call_ok, request_ok, code = pcall(function() return https.request{ url = connection.base_url, method = "POST", headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. connection.api_key, ["Content-Length"] = tostring(#payload) }, source = ltn12.source.string(payload), sink = ltn12.sink.table(response) } end)
         local body = table.concat(response)

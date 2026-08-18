@@ -5,6 +5,7 @@ return {
     api_key = "your-api-key",
     model = "your-model-name",
     temperature = 0.2,
-    max_output_tokens = 8192,
+    max_output_tokens = 12000,
+    request_timeout = 180,
     reasoning_effort = "low",
 }
