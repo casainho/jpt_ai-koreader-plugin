@@ -156,6 +156,18 @@ function JPTAI:init()
     local legacy_radius = self.question_history_settings:readSetting("page_radius", 1)
     self.primary_page_count = math.max(1, tonumber(self.question_history_settings:readSetting("primary_page_count", 1)) or 1)
     self.secondary_page_radius = math.max(0, tonumber(self.question_history_settings:readSetting("secondary_page_radius", legacy_radius)) or 1)
+    if self.secondary_context == "pages" then
+        self.secondary_context = self.secondary_page_radius > 0 and "nearby_pages" or "none"
+    end
+    if self.secondary_context ~= "none" and self.secondary_context ~= "nearby_pages" and self.secondary_context ~= "chapter" and self.secondary_context ~= "book" then
+        self.secondary_context = "none"
+    end
+    self.secondary_page_radius = math.max(1, self.secondary_page_radius)
+    self.selection_secondary_context = self.question_history_settings:readSetting("selection_secondary_context", "none")
+    if self.selection_secondary_context ~= "none" and self.selection_secondary_context ~= "current_page" and self.selection_secondary_context ~= "nearby_pages" and self.selection_secondary_context ~= "chapter" and self.selection_secondary_context ~= "book" then
+        self.selection_secondary_context = "none"
+    end
+    self.selection_secondary_page_radius = math.max(1, tonumber(self.question_history_settings:readSetting("selection_secondary_page_radius", 1)) or 1)
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self:registerDictionaryButton()
@@ -225,6 +237,39 @@ function JPTAI:getBookTitle()
     if title and title:match("%S") then return title end
     local file = self.ui and self.ui.document and self.ui.document.file
     return file and ((file:match("([^/]+)$") or file):gsub("%.[^%.]+$", "")) or _("Book")
+end
+
+function JPTAI:getCurrentPageNumber()
+    local document = self.ui and self.ui.document
+    if not document then return nil end
+    if document.info and document.info.has_pages then
+        return self.ui.view and self.ui.view.state and self.ui.view.state.page or nil
+    end
+    local ok, page = pcall(function()
+        return document:getPageFromXPointer(document:getXPointer())
+    end)
+    return ok and page or nil
+end
+
+function JPTAI:getActionTarget(mode)
+    local selected = self:getSelectedText()
+    if selected and selected:match("%S") then return selected end
+    if mode == "book" then
+        return string.format(_("current book - %s"), self:getBookTitle())
+    end
+    local page = self:getCurrentPageNumber()
+    if mode == "chapter" then
+        local toc = self.ui and self.ui.toc
+        local ok, title = pcall(function()
+            return toc and toc:getTocTitleByPage(page)
+        end)
+        if ok and type(title) == "string" and title:match("%S") then
+            return string.format(_("current chapter (%s)"), title)
+        end
+        return _("current chapter")
+    end
+    if page then return string.format(_("current page (%d)"), page) end
+    return _("current page")
 end
 
 -- The chat uses MuPDF HTML while EPUBs use CRengine, so their typesetting
@@ -355,6 +400,13 @@ function JPTAI:getContext(primary_mode, secondary_mode)
                 return heading, document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""
             end
             radius = radius or 1
+            if is_secondary and mode == "current_page" then
+                return "[Context: Current page -- " .. current .. "]", getPageRange(current, current)
+            end
+            if is_secondary and mode == "nearby_pages" then
+                local first, last = math.max(1, current - radius), math.min(total, current + radius)
+                return "[Context: Nearby pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
+            end
             if is_secondary and primary_mode == "pages" and not (selected and selected:match("%S")) then
                 local primary_radius = math.floor((self.primary_page_count - 1) / 2)
                 local before = getPageRange(math.max(1, current - primary_radius - radius), current - primary_radius - 1)
@@ -369,8 +421,9 @@ function JPTAI:getContext(primary_mode, secondary_mode)
         if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor((self.primary_page_count - 1) / 2), false) end
         if primary_error then return nil, primary_error end
         local secondary_heading, secondary_text, secondary_error
-        if primary_mode ~= "book" and secondary_mode and secondary_mode ~= "none" then
-            secondary_heading, secondary_text, secondary_error = contextPart(secondary_mode, self.secondary_page_radius, true)
+        if secondary_mode and secondary_mode ~= "none" then
+            local secondary_radius = selected and selected:match("%S") and self.selection_secondary_page_radius or self.secondary_page_radius
+            secondary_heading, secondary_text, secondary_error = contextPart(secondary_mode, secondary_radius, true)
             if secondary_error then return nil, secondary_error end
         end
         local function contextLine(kind, heading)
@@ -386,7 +439,7 @@ function JPTAI:getContext(primary_mode, secondary_mode)
         end
         local response_heading = '<div class="jpt-context">' .. htmlEscape(main_line)
         if secondary_line then response_heading = response_heading .. "<br/>" .. htmlEscape(secondary_line) end
-        return context, "primary and secondary context", response_heading .. "</div>"
+        return context, secondary_line and "primary and secondary context" or "primary context", response_heading .. "</div>"
     end)
     text = ok and text and plainText(text) or text
     if not text or text == "" then return nil, _("KOReader could not extract text from this book.") end
@@ -414,13 +467,23 @@ function JPTAI:setContext(kind, mode)
     self.question_history_settings:saveSetting(kind .. "_context", mode):flush()
 end
 
+function JPTAI:setSelectionSecondaryContext(mode)
+    self.selection_secondary_context = mode
+    self.question_history_settings:saveSetting("selection_secondary_context", mode):flush()
+end
+
+function JPTAI:setSelectionSecondaryPageRadius(value)
+    self.selection_secondary_page_radius = math.max(1, math.floor(tonumber(value) or 1))
+    self.question_history_settings:saveSetting("selection_secondary_page_radius", self.selection_secondary_page_radius):flush()
+end
+
 function JPTAI:setPageRadius(kind, value)
     if kind == "primary" then
         self.primary_page_count = math.max(1, math.floor(tonumber(value) or 1))
         self.question_history_settings:saveSetting("primary_page_count", self.primary_page_count):flush()
         return
     end
-    self[kind .. "_page_radius"] = math.max(kind == "secondary" and 0 or 1, math.floor(tonumber(value) or 1))
+    self[kind .. "_page_radius"] = math.max(1, math.floor(tonumber(value) or 1))
     self.question_history_settings:saveSetting(kind .. "_page_radius", self[kind .. "_page_radius"]):flush()
 end
 
@@ -522,14 +585,20 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     local composer
     local default_button_sep_width = ButtonTable.sep_width
     local selected_mode = mode == "chapter" and "chapter" or (mode == "maximum" or mode == "book") and "book" or self.primary_context
-    local selected_secondary = secondary_mode or self.secondary_context
-    local function submitQuestion(asked)
+    local selected = self:getSelectedText()
+    local has_selection = selected and selected:match("%S")
+    local selected_secondary = secondary_mode or (has_selection and self.selection_secondary_context or self.secondary_context)
+    local function submitQuestion(asked, action)
         UIManager:close(composer)
         if asked and asked:match("%S") then
-            local selected = self:getSelectedText()
             local display_question = asked
-            if selected and selected:match("%S") then
-                display_question = selected .. "\n\n" .. asked
+            if action then
+                display_question = action .. ": " .. self:getActionTarget(selected_mode)
+            else
+                local selected = self:getSelectedText()
+                if selected and selected:match("%S") then
+                    display_question = selected .. "\n\n" .. asked
+                end
             end
             local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_secondary)
             self:sendQuestion(asked, selected_mode, waiting, selected_secondary, display_question)
@@ -542,9 +611,10 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         condensed = true, allow_newline = true,
         buttons = {
             {
-                { text = _("Explain"), callback = function() submitQuestion("Explain the text clearly and concisely.") end },
-                { text = _("Summarize"), callback = function() submitQuestion("Summarize the selected text, preserving the main ideas and important details.") end },
-                { text = _("Translate"), callback = function() submitQuestion("Translate the selected text into " .. self.translation_language .. ", preserving its meaning and tone.") end },
+                { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning")) end },
+                { text = _("Explain"), callback = function() submitQuestion("Explain the Main context clearly. Use the Secondary context only when it helps clarify the explanation. Use examples when helpful.", _("Explain")) end },
+                { text = _("Summarize"), callback = function() submitQuestion("Summarize the Main context, preserving its main ideas and important details. Use the Secondary context only to interpret the Main context correctly.", _("Summarize")) end },
+                { text = _("Translate"), callback = function() submitQuestion("Translate the Main context into " .. self.translation_language .. ", preserving its meaning and tone. Use the Secondary context to resolve ambiguity, but do not translate the Secondary context.", _("Translate")) end },
             },
             {
                 { text = _("Close"), callback = function()
@@ -570,43 +640,90 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         composer._input_widget.charpos = cursor_charpos
         composer._input_widget:initTextBox(composer._input_widget.text)
     end
-    local function addContextButtons(kind, title)
-        local current = self[kind .. "_context"]
-        local radius = kind == "primary" and self.primary_page_count or self.secondary_page_radius
-        local secondary_disabled = kind == "secondary" and self.primary_context == "book"
-        local chapter_disabled = secondary_disabled or (kind == "secondary" and self.primary_context == "chapter")
-        local pages_disabled = secondary_disabled or (kind == "secondary" and self.primary_context == "chapter")
+    local function addPrimaryContextButtons()
+        local current = self.primary_context
         composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {{
-            { text = title, align = "left", font_bold = true, callback = function() end },
+            { text = _("MAIN CONTEXT"), align = "left", font_bold = true, callback = function() end },
         }, {
-            { text = (current == "pages" and "✓ " or "") .. (kind == "primary" and "Pages (" or "± Pages (") .. radius .. ")", enabled = not pages_disabled, callback = function()
+            { text = (current == "pages" and "✓ " or "") .. "Pages (" .. self.primary_page_count .. ")", callback = function()
                 local draft, cursor = composer:getInputText(), composer._input_widget.charpos
-                if kind == "secondary" and current == "pages" then
-                    self:setContext(kind, "none")
-                    UIManager:close(composer)
-                    self:openComposer(nil, response, question, chat_dialog, draft, cursor)
-                    return
-                end
-                self:setContext(kind, "pages")
+                self:setContext("primary", "pages")
                 UIManager:close(composer)
                 UIManager:show(SpinWidget:new{
-                    title_text = kind == "primary" and _("Pages in the primary context") or _("Additional pages on each side"),
-                    info_text = kind == "primary" and _("Choose an odd total: 1, 3, 5, and so on.") or _("Pages included before and after the current page."),
-                    value = radius, value_min = kind == "primary" and 1 or 0, value_max = kind == "primary" and 21 or 20, value_step = kind == "primary" and 2 or 1, value_hold_step = kind == "primary" and 2 or 1, precision = "%d",
+                    title_text = _("Pages in the primary context"),
+                    info_text = _("Choose an odd total: 1, 3, 5, and so on."),
+                    value = self.primary_page_count, value_min = 1, value_max = 21, value_step = 2, value_hold_step = 2, precision = "%d",
                     callback = function(spin)
-                        self:setPageRadius(kind, spin.value)
+                        self:setPageRadius("primary", spin.value)
                     end,
                     close_callback = function()
                         self:openComposer(nil, response, question, chat_dialog, draft, cursor)
                     end,
                 })
             end },
-            { text = current == "chapter" and "✓ Chapter" or "Chapter", enabled = not chapter_disabled, callback = function() self:setContext(kind, kind == "secondary" and current == "chapter" and "none" or "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
-            { text = current == "book" and "✓ Book" or "Book", enabled = not secondary_disabled, callback = function() self:setContext(kind, kind == "secondary" and current == "book" and "none" or "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+            { text = current == "chapter" and "✓ Chapter" or "Chapter", callback = function() self:setContext("primary", "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
+            { text = current == "book" and "✓ Book" or "Book", callback = function() self:setContext("primary", "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
         }}, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
     end
-    addContextButtons("primary", _("PRIMARY CONTEXT"))
-    addContextButtons("secondary", _("SECONDARY CONTEXT"))
+    local function chooseSecondary(choice, for_selection)
+        local draft, cursor = composer:getInputText(), composer._input_widget.charpos
+        if for_selection then self:setSelectionSecondaryContext(choice) else self:setContext("secondary", choice) end
+        UIManager:close(composer)
+        self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice)
+    end
+    local function addSelectedMainContext()
+        composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {
+            {{ text = _("MAIN CONTEXT"), align = "left", font_bold = true, callback = function() end }},
+            {{ text = "✓ " .. _("Selected text"), callback = function() end }},
+        }, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
+    end
+    local function addSecondaryContextButtons(current, radius, for_selection)
+        local compact_font_size = 16
+        local context_row = {
+            { text = (current == "none" and "✓ " or "") .. _("None"), font_size = compact_font_size, callback = function() chooseSecondary("none", for_selection) end },
+        }
+        if for_selection then
+            table.insert(context_row, { text = (current == "current_page" and "✓ " or "") .. _("Page"), font_size = compact_font_size, callback = function() chooseSecondary("current_page", true) end })
+        end
+        table.insert(context_row, { text = (current == "nearby_pages" and "✓ " or "") .. string.format(_("Pages ±%d"), radius), font_size = compact_font_size, callback = function()
+                local draft, cursor = composer:getInputText(), composer._input_widget.charpos
+                if for_selection then
+                    self:setSelectionSecondaryContext("nearby_pages")
+                else
+                    self:setContext("secondary", "nearby_pages")
+                end
+                UIManager:close(composer)
+                UIManager:show(SpinWidget:new{
+                    title_text = _("Nearby pages on each side"),
+                    info_text = _("Includes the current page and this many pages before and after it."),
+                    value = radius, value_min = 1, value_max = 20, value_step = 1, value_hold_step = 1, precision = "%d",
+                    callback = function(spin)
+                        if for_selection then
+                            self:setSelectionSecondaryPageRadius(spin.value)
+                        else
+                            self:setPageRadius("secondary", spin.value)
+                        end
+                    end,
+                    close_callback = function()
+                        local choice = for_selection and self.selection_secondary_context or self.secondary_context
+                        self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice)
+                    end,
+                })
+            end })
+        table.insert(context_row, { text = (current == "chapter" and "✓ " or "") .. _("Chapter"), font_size = compact_font_size, callback = function() chooseSecondary("chapter", for_selection) end })
+        table.insert(context_row, { text = (current == "book" and "✓ " or "") .. _("Book"), font_size = compact_font_size, callback = function() chooseSecondary("book", for_selection) end })
+        composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {
+            {{ text = _("SECONDARY CONTEXT"), align = "left", font_bold = true, callback = function() end }},
+            context_row,
+        }, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
+    end
+    if has_selection then
+        addSelectedMainContext()
+        addSecondaryContextButtons(selected_secondary, self.selection_secondary_page_radius, true)
+    else
+        addPrimaryContextButtons()
+        addSecondaryContextButtons(selected_secondary, self.secondary_page_radius, false)
+    end
     UIManager:show(composer)
     composer:onShowKeyboard()
 end
@@ -618,7 +735,7 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     if type(question) ~= "string" then question = nil end
     local screen, dialog = Device.screen, nil
     local width = math.floor(screen:getWidth() * 0.94)
-    local markdown = question and ("**Question:**  \n" .. question .. "\n\n---\n" .. response) or response
+    local markdown = question and (question .. "\n\n---\n" .. response) or response
     local css, font_size = self:getBookTextStyle(self.font_multiplier)
     -- A malformed Markdown response must not close KOReader while the answer
     -- dialog is being built. Fall back to escaped plain text in that case.
@@ -683,7 +800,7 @@ function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_q
         local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
         https.TIMEOUT = math.max(60, tonumber(self.config.request_timeout) or 180)
         local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low",
-            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. "\n\nQUESTION:\n" .. question }} })
+            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. "\n\nQUESTION:\n" .. question }} })
         local response = {}
         local call_ok, request_ok, code = pcall(function() return https.request{ url = connection.base_url, method = "POST", headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. connection.api_key, ["Content-Length"] = tostring(#payload) }, source = ltn12.source.string(payload), sink = ltn12.sink.table(response) } end)
         local body = table.concat(response)
