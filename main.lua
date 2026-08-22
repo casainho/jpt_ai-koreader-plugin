@@ -170,25 +170,40 @@ function JPTAI:init()
     self.selection_secondary_page_radius = math.max(1, tonumber(self.question_history_settings:readSetting("selection_secondary_page_radius", 1)) or 1)
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
+    self:registerAutomaticSelectionLaunch()
     self:registerDictionaryButton()
-    if self.ui.highlight then
-        self.ui.highlight:addToHighlightDialog("08a_jpt_ai", function(this)
-            return {
-                text = "JPT AI",
-                callback = function()
-                    local selected = util.cleanupSelectedText(this.selected_text.text)
-                    local selected_chars = util.splitToChars(selected)
-                    this:onClose()
-                    self.pending_selected_text = selected
-                    self:openComposer("minimum", nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
-                end,
-            }
-        end)
+end
+
+function JPTAI:openSelectedTextComposer(selected)
+    local selected_chars = util.splitToChars(selected)
+    self.pending_selected_text = selected
+    UIManager:nextTick(function()
+        self:openComposer("minimum", nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
+    end)
+end
+
+-- KOReader normally opens its highlight menu (or the dictionary for one word)
+-- when selection ends. Replace that final action so both words and passages
+-- go straight to JPT AI, while preserving the selected text before KOReader
+-- clears its temporary selection state.
+function JPTAI:registerAutomaticSelectionLaunch()
+    local highlight = self.ui and self.ui.highlight
+    if not highlight or highlight._jpt_ai_original_onHoldRelease then return end
+    highlight._jpt_ai_original_onHoldRelease = highlight.onHoldRelease
+    highlight.onHoldRelease = function(this, ...)
+        local raw_selected = this.selected_text and this.selected_text.text
+        local selected = raw_selected and util.cleanupSelectedText(raw_selected)
+        if selected and selected:match("%S") and not this.clear_id then
+            this:onClose()
+            self:openSelectedTextComposer(selected)
+            return true
+        end
+        return highlight._jpt_ai_original_onHoldRelease(this, ...)
     end
 end
 
 -- A normal long press on a single word opens KOReader's dictionary directly,
--- bypassing the multi-word highlight menu. Add an action there as well.
+-- but the JPT AI button remains useful when opening the dictionary manually.
 function JPTAI:registerDictionaryButton()
     if not (self.ui and self.ui.dictionary) then return end
     self.ui.dictionary:addToDictButtons({
@@ -199,9 +214,7 @@ function JPTAI:registerDictionaryButton()
             local selected = util.cleanupSelectedText(dict_popup.lookupword or dict_popup.word or "")
             if not selected:match("%S") then return end
             dict_popup:onClose()
-            self.pending_selected_text = selected
-            local selected_chars = util.splitToChars(selected)
-            self:openComposer("minimum", nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
+            self:openSelectedTextComposer(selected)
         end,
     })
 end
@@ -588,20 +601,24 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     local selected = self:getSelectedText()
     local has_selection = selected and selected:match("%S")
     local selected_secondary = secondary_mode or (has_selection and self.selection_secondary_context or self.secondary_context)
+    local conversation = self.pending_conversation
+    self.pending_conversation = nil
     local function submitQuestion(asked, action)
-        UIManager:close(composer)
         if asked and asked:match("%S") then
-            local display_question = asked
+            local question_for_model = asked
+            if not action and has_selection and asked:sub(1, #selected) == selected then
+                question_for_model = asked:sub(#selected + 1):gsub("^%s+", "")
+            end
+            if not question_for_model:match("%S") then return end
+            UIManager:close(composer)
+            local display_question = question_for_model
             if action then
                 display_question = action .. ": " .. self:getActionTarget(selected_mode)
-            else
-                local selected = self:getSelectedText()
-                if selected and selected:match("%S") then
-                    display_question = selected .. "\n\n" .. asked
-                end
+            elseif has_selection then
+                display_question = selected .. "\n\n" .. question_for_model
             end
-            local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_secondary)
-            self:sendQuestion(asked, selected_mode, waiting, selected_secondary, display_question)
+            local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_secondary, selected, conversation)
+            self:sendQuestion(question_for_model, selected_mode, waiting, selected_secondary, display_question, selected, conversation)
         end
     end
     ButtonTable.sep_width = default_button_sep_width * 2
@@ -611,10 +628,10 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         condensed = true, allow_newline = true,
         buttons = {
             {
-                { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning")) end },
-                { text = _("Explain"), callback = function() submitQuestion("Explain the Main context clearly. Use the Secondary context only when it helps clarify the explanation. Use examples when helpful.", _("Explain")) end },
-                { text = _("Summarize"), callback = function() submitQuestion("Summarize the Main context, preserving its main ideas and important details. Use the Secondary context only to interpret the Main context correctly.", _("Summarize")) end },
                 { text = _("Translate"), callback = function() submitQuestion("Translate the Main context into " .. self.translation_language .. ", preserving its meaning and tone. Use the Secondary context to resolve ambiguity, but do not translate the Secondary context.", _("Translate")) end },
+                { text = _("Summarize"), callback = function() submitQuestion("Summarize the Main context, preserving its main ideas and important details. Use the Secondary context only to interpret the Main context correctly.", _("Summarize")) end },
+                { text = _("Explain"), callback = function() submitQuestion("Explain the Main context clearly. Use the Secondary context only when it helps clarify the explanation. Use examples when helpful.", _("Explain")) end },
+                { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning")) end },
             },
             {
                 { text = _("Close"), callback = function()
@@ -728,14 +745,15 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     composer:onShowKeyboard()
 end
 
-function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages)
+function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages, selected_text, conversation)
     if previous_dialog then UIManager:close(previous_dialog) end
     input_hidden = true
     if type(response) ~= "string" then response = tostring(response or "") end
     if type(question) ~= "string" then question = nil end
     local screen, dialog = Device.screen, nil
     local width = math.floor(screen:getWidth() * 0.94)
-    local markdown = question and (question .. "\n\n---\n" .. response) or response
+    local current_turn = question and ("User:\n" .. question .. "\n\nJPT AI:\n" .. response) or response
+    local markdown = (conversation and conversation .. "\n\n" or "") .. current_turn
     local css, font_size = self:getBookTextStyle(self.font_multiplier)
     -- A malformed Markdown response must not close KOReader while the answer
     -- dialog is being built. Fall back to escaped plain text in that case.
@@ -744,12 +762,27 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
         logger.warn("JPT AI could not render the response as Markdown:", tostring(html_body))
         html_body = "<pre>" .. htmlEscape(markdown) .. "</pre>"
     end
+    local function continueChat()
+        local transcript = (conversation and conversation .. "\n\n" or "")
+            .. "User:\n" .. (question or "") .. "\n\nJPT AI:\n" .. response
+        -- The selection belongs to the first turn only. It remains visible
+        -- in the transcript, but must not become the target of every follow-up.
+        self.pending_selected_text = nil
+        self.pending_conversation = transcript
+        self:openComposer("page", response, question, dialog, "", nil, nearby_pages)
+    end
     dialog = CompactChatDialog:new{
         title = "JPT AI - " .. self:getBookTitle(), input = input_text or "", input_hint = _("Write your question here"),
         fullscreen = true, condensed = true, allow_newline = true, keyboard_visible = false,
         buttons = {{
-            { text = _("Close"), width = math.floor(width / 2), callback = function() UIManager:close(dialog) end },
-            { text = _("Ask"), width = math.floor(width / 2), callback = function() self:openComposer("page", response, question, dialog, nil, nil, nearby_pages) end },
+            { text = _("Back"), width = math.floor(width / 3), callback = function()
+                self.pending_selected_text = selected_text
+                local draft = selected_text and (selected_text .. "\n\n") or nil
+                local cursor = selected_text and (#util.splitToChars(selected_text) + 2) or nil
+                self:openComposer("page", response, question, dialog, draft, cursor, nearby_pages)
+            end },
+            { text = _("Continue"), width = math.floor(width / 3), is_enter_default = true, callback = continueChat },
+            { text = _("Close"), width = math.floor(width / 3), callback = function() UIManager:close(dialog) end },
         }},
     }
     local output = ScrollHtmlWidget:new{
@@ -773,9 +806,6 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
         if widget == output_row then table.remove(dialog.vgroup, index); table.insert(dialog.vgroup, 2, output_row); break end
     end
     if input_hidden then table.remove(dialog.vgroup, 5); table.remove(dialog.vgroup, 4); table.remove(dialog.vgroup, 3) end
-    dialog.onSwitchFocus = function()
-        if not input_hidden then UIManager:nextTick(function() self:openComposer("page", response, question, dialog, nil, nil, nearby_pages) end) end
-    end
     -- The dialog is fullscreen, but InputDialog normally asks KOReader to
     -- refresh only its content-sized frame. Force a complete e-ink repaint so
     -- no pixels from the preceding window remain at the top of the screen.
@@ -784,36 +814,35 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
         UIManager:setDirty("all", "full")
     end
     UIManager:show(dialog, "full")
-    if not input_hidden then dialog:lockKeyboard(true) end
     return dialog
 end
 
-function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_question)
+function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_question, selected_text, conversation)
     display_question = display_question or question
     local connection, error_message = self:loadConnection()
-    if not connection then self:openChat(mode, error_message, display_question, chat_dialog, nil, nil, nearby_pages); return end
+    if not connection then self:openChat(mode, error_message, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation); return end
     local context, label, response_heading = self:getContext(mode, nearby_pages)
     self.pending_selected_text = nil
-    if not context then self:openChat(mode, label, display_question, chat_dialog, nil, nil, nearby_pages); return end
+    if not context then self:openChat(mode, label, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation); return end
     UIManager:nextTick(function()
         local response_length = response_lengths[self.response_length] or response_lengths.medium
         local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
         https.TIMEOUT = math.max(60, tonumber(self.config.request_timeout) or 180)
         local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low",
-            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. "\n\nQUESTION:\n" .. question }} })
+            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. (conversation and "\n\nCONVERSATION SO FAR:\n" .. conversation or "") .. "\n\nQUESTION:\n" .. question }} })
         local response = {}
         local call_ok, request_ok, code = pcall(function() return https.request{ url = connection.base_url, method = "POST", headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. connection.api_key, ["Content-Length"] = tostring(#payload) }, source = ltn12.source.string(payload), sink = ltn12.sink.table(response) } end)
         local body = table.concat(response)
         if not call_ok or not request_ok or tonumber(code) ~= 200 then
             logger.warn("JPT AI request failed:", tostring(code))
-            self:openChat(mode, self:formatRequestError(code, body, request_ok), display_question, chat_dialog, nil, nil, nearby_pages)
+            self:openChat(mode, self:formatRequestError(code, body, request_ok), display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation)
             return
         end
         local ok, decoded = pcall(json.decode, body)
         local answer = ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
         answer = answer or _("JPT AI received no readable response.")
         if response_heading then answer = response_heading .. "\n\n" .. answer end
-        self:openChat(mode, answer, display_question, chat_dialog, nil, nil, nearby_pages)
+        self:openChat(mode, answer, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation)
     end)
 end
 
