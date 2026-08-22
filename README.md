@@ -58,8 +58,9 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 ## Using the plugin
 
 - Open **JPT AI** from KOReader's tools menu or bind its `Open JPT AI` action to a gesture.
-- Select text in a book and choose **JPT AI** from the selection menu.
-- Use **Meaning**, **Explain**, **Summarize**, or **Translate** for a quick response, or write a custom question.
+- Select text in a book to open **JPT AI** directly; KOReader's selection menu and dictionary popup are skipped for that selection.
+- The selected text goes directly to JPT AI as its Main context and is prefilled in the question field, ready for you to continue typing. It is sent as context only once and is not repeated in the result header.
+- Use **Translate**, **Summarize**, **Explain**, or **Meaning** for a quick response, or write a custom question.
 - Without selected text, use **MAIN CONTEXT** to choose primary pages, the current chapter, or the complete book. Primary **Pages (n)** uses an odd total: 1, 3, 5, and so on.
 - With selected text, the selection is shown as the fixed **MAIN CONTEXT**.
 - With selected text, the single **SECONDARY CONTEXT** row contains **None**, **Page**, **Pages ±N**, **Chapter**, and **Book**.
@@ -72,10 +73,10 @@ The detailed instructions sent to the configured model remain hidden. The answer
 
 | Button | Selected text | Pages | Chapter | Book |
 | --- | --- | --- | --- | --- |
-| **Meaning** | `Meaning: <selected text>` | `Meaning: current page (<page number>)` | `Meaning: current chapter (<chapter>)` | `Meaning: current book - <book name>` |
-| **Explain** | `Explain: <selected text>` | `Explain: current page (<page number>)` | `Explain: current chapter (<chapter>)` | `Explain: current book - <book name>` |
-| **Summarize** | `Summarize: <selected text>` | `Summarize: current page (<page number>)` | `Summarize: current chapter (<chapter>)` | `Summarize: current book - <book name>` |
 | **Translate** | `Translate: <selected text>` | `Translate: current page (<page number>)` | `Translate: current chapter (<chapter>)` | `Translate: current book - <book name>` |
+| **Summarize** | `Summarize: <selected text>` | `Summarize: current page (<page number>)` | `Summarize: current chapter (<chapter>)` | `Summarize: current book - <book name>` |
+| **Explain** | `Explain: <selected text>` | `Explain: current page (<page number>)` | `Explain: current chapter (<chapter>)` | `Explain: current book - <book name>` |
+| **Meaning** | `Meaning: <selected text>` | `Meaning: current page (<page number>)` | `Meaning: current chapter (<chapter>)` | `Meaning: current book - <book name>` |
 
 For **Translate**, the model uses the language selected under **Options → Translation language**. The selected **Response length** controls the expected amount of detail and the maximum output-token allowance for every action; the quick actions do not impose their own response length.
 
