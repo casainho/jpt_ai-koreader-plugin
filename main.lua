@@ -3,6 +3,7 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local TopContainer = require("ui/widget/container/topcontainer")
 local ButtonTable = require("ui/widget/buttontable")
 local ButtonDialog = require("ui/widget/buttondialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local SpinWidget = require("ui/widget/spinwidget")
@@ -17,11 +18,13 @@ local LuaSettings = require("luasettings")
 local ltn12 = require("ltn12")
 local https = require("ssl.https")
 local json = require("json")
+local ContextPolicy = require("context_policy")
 local util = require("util")
 local _ = require("gettext")
 local logger = require("logger")
 local Blitbuffer = require("ffi/blitbuffer")
 local Geom = require("ui/geometry")
+local Size = require("ui/size")
 
 local JPTAI = WidgetContainer:extend{ name = "jpt_ai", is_doc_only = true }
 
@@ -126,22 +129,6 @@ local function renderMarkdown(markdown)
     return html
 end
 
-local function extractPdfText(document, first_page, last_page)
-    local parts = {}
-    for page = first_page, last_page do
-        local text = document:getPageText(page) or ""
-        if type(text) == "table" then
-            local words = {}
-            for _, block in ipairs(text) do
-                for _, span in ipairs(block) do if type(span) == "table" and span.word then table.insert(words, span.word) end end
-            end
-            text = table.concat(words, " ")
-        end
-        table.insert(parts, text)
-    end
-    return table.concat(parts, "\n")
-end
-
 function JPTAI:init()
     self.path = pluginDirectory()
     local ok, config = pcall(dofile, self.path .. "jpt_ai_config.lua")
@@ -168,6 +155,7 @@ function JPTAI:init()
         self.selection_secondary_context = "none"
     end
     self.selection_secondary_page_radius = math.max(1, tonumber(self.question_history_settings:readSetting("selection_secondary_page_radius", 1)) or 1)
+    self.active_request = nil
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self:registerAutomaticSelectionLaunch()
@@ -231,9 +219,9 @@ function JPTAI:addToMainMenu(menu_items)
     menu_items.jpt_ai = {
         text = _("JPT AI"), sorting_hint = "more_tools",
         sub_item_table = {
-            { text = _("Ask (minimum context)"), callback = function() self:ask("minimum") end },
-            { text = _("Ask (medium context)"), callback = function() self:ask("medium") end },
-            { text = _("Ask (maximum context: complete book)"), callback = function() self:ask("maximum") end },
+            { text = _("Ask (minimum: current page)"), callback = function() self:ask("minimum") end },
+            { text = _("Ask (medium: 3 pages)"), callback = function() self:ask("medium") end },
+            { text = _("Ask (maximum: complete book)"), callback = function() self:ask("maximum") end },
         },
     }
 end
@@ -264,7 +252,7 @@ function JPTAI:getCurrentPageNumber()
     return ok and page or nil
 end
 
-function JPTAI:getActionTarget(mode)
+function JPTAI:getActionTarget(mode, page_count)
     local selected = self:getSelectedText()
     if selected and selected:match("%S") then return selected end
     if mode == "book" then
@@ -280,6 +268,9 @@ function JPTAI:getActionTarget(mode)
             return string.format(_("current chapter (%s)"), title)
         end
         return _("current chapter")
+    end
+    if page and page_count and page_count > 1 then
+        return string.format(_("current page ±%d pages (%d total)"), math.floor((page_count - 1) / 2), page_count)
     end
     if page then return string.format(_("current page (%d)"), page) end
     return _("current page")
@@ -329,6 +320,7 @@ function JPTAI:formatRequestError(code, body, request_ok)
     local original = body and (body:match('"message"%s*:%s*"(.-)"') or body:match('"error"%s*:%s*"(.-)"'))
     original = original or (code and tostring(code)) or (request_ok and tostring(request_ok)) or "unknown error"
     local status = tonumber(code)
+    local category = ContextPolicy.errorCategory(code, original)
     local explanations = {
         [400] = _("The request was rejected. Check the endpoint, model, and request settings."),
         [401] = _("Authentication failed. Check the API key in jpt_ai_config.lua."),
@@ -344,6 +336,13 @@ function JPTAI:formatRequestError(code, body, request_ok)
         [504] = _("The AI service timed out. Try again or use less context."),
     }
     local explanation = explanations[status]
+    if not explanation and category == "timeout" then
+        explanation = _("The network request timed out. Check the connection and try again.")
+    elseif not explanation and category == "tls_error" then
+        explanation = _("A secure connection could not be established. Check the endpoint URL and device time.")
+    elseif not explanation and category == "too_large" then
+        explanation = explanations[413]
+    end
     if not explanation and status and status >= 500 then
         explanation = _("The AI service is unavailable. Try again later.")
     end
@@ -369,21 +368,20 @@ function JPTAI:getDocument()
     return document, pages
 end
 
-function JPTAI:getContext(primary_mode, secondary_mode)
+function JPTAI:getContext(primary_mode, secondary_mode, primary_page_count)
     local selected = self:getSelectedText()
     local document, total = self:getDocument()
     if not document then return nil, total end
     local ok, text, label, response_heading = pcall(function()
         local function getPageRange(first, last)
             if first > last then return "" end
-            if document.info.has_pages then return extractPdfText(document, first, last) end
-            return document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""
+            return ContextPolicy.getPageTextRange(document, total, first, last)
         end
         local current = document.info.has_pages and (self.ui.view and self.ui.view.state.page or 1) or document:getPageFromXPointer(document:getXPointer())
         local function contextPart(mode, radius, is_secondary)
             if mode == "book" then
                 local heading = "[Context: Complete book]"
-                if document.info.has_pages then return heading, extractPdfText(document, 1, total) end
+                if document.info.has_pages then return heading, ContextPolicy.getPageTextRange(document, total, 1, total) end
                 local original = document:getXPointer()
                 document:gotoPos(0); local first = document:getXPointer()
                 document:gotoPage(total); local last = document:getXPointer()
@@ -409,8 +407,7 @@ function JPTAI:getContext(primary_mode, secondary_mode)
             if not next_ok then return nil, nil, chapter_error end
             local last = math.min(total, (next_chapter or (total + 1)) - 1)
                 local heading = "[Context: Chapter -- " .. chapter_title .. "]\n[Pages — " .. string.format("%d-%d", first, last) .. "]"
-                if document.info.has_pages then return heading, extractPdfText(document, first, last) end
-                return heading, document:getTextFromXPointers(document:getPageXPointer(first), document:getPageXPointer(math.min(last + 1, total))) or ""
+                return heading, ContextPolicy.getPageTextRange(document, total, first, last)
             end
             radius = radius or 1
             if is_secondary and mode == "current_page" then
@@ -421,7 +418,7 @@ function JPTAI:getContext(primary_mode, secondary_mode)
                 return "[Context: Nearby pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
             end
             if is_secondary and primary_mode == "pages" and not (selected and selected:match("%S")) then
-                local primary_radius = math.floor((self.primary_page_count - 1) / 2)
+                local primary_radius = math.floor(((primary_page_count or self.primary_page_count) - 1) / 2)
                 local before = getPageRange(math.max(1, current - primary_radius - radius), current - primary_radius - 1)
                 local after = getPageRange(current + primary_radius + 1, math.min(total, current + primary_radius + radius))
                 local additional = before ~= "" and after ~= "" and (before .. "\n\n" .. after) or (before ~= "" and before or after)
@@ -431,7 +428,7 @@ function JPTAI:getContext(primary_mode, secondary_mode)
             return "[Context: Pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
         end
         local primary_heading, primary_text, primary_error
-        if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor((self.primary_page_count - 1) / 2), false) end
+        if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor(((primary_page_count or self.primary_page_count) - 1) / 2), false) end
         if primary_error then return nil, primary_error end
         local secondary_heading, secondary_text, secondary_error
         if secondary_mode and secondary_mode ~= "none" then
@@ -444,15 +441,11 @@ function JPTAI:getContext(primary_mode, secondary_mode)
             return kind .. ": " .. title
         end
         local main_line = contextLine("Main context", primary_heading)
-        local context = main_line .. "\n\n" .. primary_text
-        local secondary_line
-        if secondary_heading and secondary_text and secondary_text ~= "" then
-            secondary_line = contextLine("Secondary context", secondary_heading)
-            context = context .. "\n\n" .. secondary_line .. "\n\n" .. secondary_text
-        end
+        local secondary_line = secondary_heading and contextLine("Secondary context", secondary_heading) or nil
+        local context, label, _, included_secondary_line = ContextPolicy.combineContext(main_line, primary_text, secondary_line, secondary_text)
         local response_heading = '<div class="jpt-context">' .. htmlEscape(main_line)
-        if secondary_line then response_heading = response_heading .. "<br/>" .. htmlEscape(secondary_line) end
-        return context, secondary_line and "primary and secondary context" or "primary context", response_heading .. "</div>"
+        if included_secondary_line then response_heading = response_heading .. "<br/>" .. htmlEscape(included_secondary_line) end
+        return context, label, response_heading .. "</div>"
     end)
     text = ok and text and plainText(text) or text
     if not text or text == "" then return nil, _("KOReader could not extract text from this book.") end
@@ -594,13 +587,17 @@ function JPTAI:openComposerOptions(resume_composer)
     UIManager:show(options)
 end
 
-function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, cursor_charpos, secondary_mode)
+function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, cursor_charpos, secondary_mode, input_expanded)
     local composer
     local default_button_sep_width = ButtonTable.sep_width
-    local selected_mode = mode == "chapter" and "chapter" or (mode == "maximum" or mode == "book") and "book" or self.primary_context
+    local composer_width = math.floor(Device.screen:getWidth() * 0.75)
+    input_expanded = input_expanded == true
     local selected = self:getSelectedText()
     local has_selection = selected and selected:match("%S")
-    local selected_secondary = secondary_mode or (has_selection and self.selection_secondary_context or self.secondary_context)
+    local preset = ContextPolicy.resolvePreset(mode, has_selection)
+    local selected_mode = preset and preset.primary_context or (mode == "chapter" and "chapter" or mode == "book" and "book" or self.primary_context)
+    local selected_page_count = preset and preset.primary_page_count or self.primary_page_count
+    local selected_secondary = secondary_mode or (preset and preset.secondary_context) or (has_selection and self.selection_secondary_context or self.secondary_context)
     local conversation = self.pending_conversation
     self.pending_conversation = nil
     local function submitQuestion(asked, action)
@@ -610,21 +607,36 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                 question_for_model = asked:sub(#selected + 1):gsub("^%s+", "")
             end
             if not question_for_model:match("%S") then return end
-            UIManager:close(composer)
             local display_question = question_for_model
             if action then
-                display_question = action .. ": " .. self:getActionTarget(selected_mode)
+                display_question = action .. ": " .. self:getActionTarget(selected_mode, selected_page_count)
             elseif has_selection then
                 display_question = selected .. "\n\n" .. question_for_model
             end
-            local waiting = self:openChat(selected_mode, _("(Preparing answer… )"), display_question, chat_dialog, true, "", selected_secondary, selected, conversation)
-            self:sendQuestion(question_for_model, selected_mode, waiting, selected_secondary, display_question, selected, conversation)
+            self:sendQuestion(question_for_model, selected_mode, nil, selected_secondary, display_question, selected, conversation, selected_page_count, composer)
         end
+    end
+    local input_action_button
+    if input_expanded then
+        input_action_button = { text = _("Ask"), is_enter_default = true, callback = function()
+            submitQuestion(composer:getInputText())
+        end }
+    else
+        input_action_button = { text = _("Write question"), callback = function()
+            local draft = composer:getInputText()
+            local cursor = composer._input_widget.charpos
+            UIManager:close(composer)
+            self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_secondary, true)
+        end }
     end
     ButtonTable.sep_width = default_button_sep_width * 2
     composer = InputDialog:new{
-        title = _("JPT AI question"), input = input_text or (chat_dialog and chat_dialog:getInputText()) or "", input_hint = _("Write your question here"),
-        width = math.floor(Device.screen:getWidth() * 0.90), text_height = math.floor(Device.screen:getHeight() * 0.15),
+        title = input_expanded and _("JPT AI question") or _("JPT AI"), input = input_text or (chat_dialog and chat_dialog:getInputText()) or "", input_hint = input_expanded and _("Write your question here") or "",
+        width = composer_width, text_height = input_expanded and math.floor(Device.screen:getHeight() * 0.07) or 1,
+        keyboard_visible = input_expanded,
+        readonly = not input_expanded,
+        input_padding = input_expanded and Size.padding.default or 0,
+        input_margin = input_expanded and Size.margin.default or 0,
         condensed = true, allow_newline = true,
         buttons = {
             {
@@ -634,21 +646,19 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                 { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning")) end },
             },
             {
-                { text = _("Close"), callback = function()
+                { text = _("Close"), id = "close", callback = function()
                     self.pending_selected_text = nil
                     UIManager:close(composer)
                 end },
-                { text = _("Options"), width = math.floor(Device.screen:getWidth() * 0.90 / 6), callback = function()
+                { text = _("Options"), width = math.floor(composer_width / 6), callback = function()
                     local draft = composer:getInputText()
                     local cursor = composer._input_widget.charpos
                     UIManager:close(composer)
                     self:openComposerOptions(function()
-                        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_secondary)
+                        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, selected_secondary, input_expanded)
                     end)
                 end },
-                { text = _("Ask"), is_enter_default = true, callback = function()
-                    submitQuestion(composer:getInputText())
-                end },
+                input_action_button,
             },
         },
     }
@@ -658,41 +668,41 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         composer._input_widget:initTextBox(composer._input_widget.text)
     end
     local function addPrimaryContextButtons()
-        local current = self.primary_context
+        local current = selected_mode
         composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {{
-            { text = _("MAIN CONTEXT"), align = "left", font_bold = true, callback = function() end },
+            { text = _("MAIN CONTEXT"), align = "center", font_bold = true, callback = function() end },
         }, {
-            { text = (current == "pages" and "✓ " or "") .. "Pages (" .. self.primary_page_count .. ")", callback = function()
+            { text = (current == "pages" and "✓ " or "") .. "Pages (" .. selected_page_count .. ")", callback = function()
                 local draft, cursor = composer:getInputText(), composer._input_widget.charpos
                 self:setContext("primary", "pages")
                 UIManager:close(composer)
                 UIManager:show(SpinWidget:new{
                     title_text = _("Pages in the primary context"),
                     info_text = _("Choose an odd total: 1, 3, 5, and so on."),
-                    value = self.primary_page_count, value_min = 1, value_max = 21, value_step = 2, value_hold_step = 2, precision = "%d",
+                    value = selected_page_count, value_min = 1, value_max = 21, value_step = 2, value_hold_step = 2, precision = "%d",
                     callback = function(spin)
                         self:setPageRadius("primary", spin.value)
                     end,
                     close_callback = function()
-                        self:openComposer(nil, response, question, chat_dialog, draft, cursor)
+                        self:openComposer(nil, response, question, chat_dialog, draft, cursor, nil, input_expanded)
                     end,
                 })
             end },
-            { text = current == "chapter" and "✓ Chapter" or "Chapter", callback = function() self:setContext("primary", "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
-            { text = current == "book" and "✓ Book" or "Book", callback = function() self:setContext("primary", "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos) end },
-        }}, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
+            { text = current == "chapter" and "✓ Chapter" or "Chapter", callback = function() self:setContext("primary", "chapter"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos, nil, input_expanded) end },
+            { text = current == "book" and "✓ Book" or "Book", callback = function() self:setContext("primary", "book"); UIManager:close(composer); self:openComposer(nil, response, question, chat_dialog, composer:getInputText(), composer._input_widget.charpos, nil, input_expanded) end },
+        }}, sep_width = default_button_sep_width * 2, zero_sep = false, show_parent = composer })
     end
     local function chooseSecondary(choice, for_selection)
         local draft, cursor = composer:getInputText(), composer._input_widget.charpos
         if for_selection then self:setSelectionSecondaryContext(choice) else self:setContext("secondary", choice) end
         UIManager:close(composer)
-        self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice)
+        self:openComposer(selected_mode, response, question, chat_dialog, draft, cursor, choice, input_expanded)
     end
     local function addSelectedMainContext()
         composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {
-            {{ text = _("MAIN CONTEXT"), align = "left", font_bold = true, callback = function() end }},
+            {{ text = _("MAIN CONTEXT"), align = "center", font_bold = true, callback = function() end }},
             {{ text = "✓ " .. _("Selected text"), callback = function() end }},
-        }, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
+        }, sep_width = default_button_sep_width * 2, zero_sep = false, show_parent = composer })
     end
     local function addSecondaryContextButtons(current, radius, for_selection)
         local compact_font_size = 16
@@ -723,14 +733,14 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                     end,
                     close_callback = function()
                         local choice = for_selection and self.selection_secondary_context or self.secondary_context
-                        self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice)
+                        self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice, input_expanded)
                     end,
                 })
             end })
         table.insert(context_row, { text = (current == "chapter" and "✓ " or "") .. _("Chapter"), font_size = compact_font_size, callback = function() chooseSecondary("chapter", for_selection) end })
         table.insert(context_row, { text = (current == "book" and "✓ " or "") .. _("Book"), font_size = compact_font_size, callback = function() chooseSecondary("book", for_selection) end })
         composer:addWidget(ButtonTable:new{ width = composer:getAddedWidgetAvailableWidth(), buttons = {
-            {{ text = _("SECONDARY CONTEXT"), align = "left", font_bold = true, callback = function() end }},
+            {{ text = _("SECONDARY CONTEXT"), align = "center", font_bold = true, callback = function() end }},
             context_row,
         }, sep_width = default_button_sep_width * 2, zero_sep = true, show_parent = composer })
     end
@@ -741,8 +751,15 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         addPrimaryContextButtons()
         addSecondaryContextButtons(selected_secondary, self.secondary_page_radius, false)
     end
+    if not input_expanded then
+        -- The collapsed composer is for quick actions only. Keep the input
+        -- widget alive internally so drafts survive, but remove its row and
+        -- the spacer above it from the visible vertical layout.
+        table.remove(composer.vgroup, 3)
+        table.remove(composer.vgroup, 2)
+    end
     UIManager:show(composer)
-    composer:onShowKeyboard()
+    if input_expanded then composer:onShowKeyboard() end
 end
 
 function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages, selected_text, conversation)
@@ -817,33 +834,83 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     return dialog
 end
 
-function JPTAI:sendQuestion(question, mode, chat_dialog, nearby_pages, display_question, selected_text, conversation)
+function JPTAI:sendQuestion(question, mode, _unused, nearby_pages, display_question, selected_text, conversation, primary_page_count, composer)
     display_question = display_question or question
     local connection, error_message = self:loadConnection()
-    if not connection then self:openChat(mode, error_message, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation); return end
-    local context, label, response_heading = self:getContext(mode, nearby_pages)
+    if not connection then
+        self.pending_selected_text = nil
+        self:openChat(mode, error_message, display_question, composer, nil, nil, nearby_pages, selected_text, conversation)
+        return
+    end
+    local context, label, response_heading = self:getContext(mode, nearby_pages, primary_page_count)
     self.pending_selected_text = nil
-    if not context then self:openChat(mode, label, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation); return end
-    UIManager:nextTick(function()
-        local response_length = response_lengths[self.response_length] or response_lengths.medium
-        local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
-        https.TIMEOUT = math.max(60, tonumber(self.config.request_timeout) or 180)
-        local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low",
-            messages = {{ role = "system", content = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction }, { role = "user", content = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n" .. context .. (conversation and "\n\nCONVERSATION SO FAR:\n" .. conversation or "") .. "\n\nQUESTION:\n" .. question }} })
-        local response = {}
-        local call_ok, request_ok, code = pcall(function() return https.request{ url = connection.base_url, method = "POST", headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. connection.api_key, ["Content-Length"] = tostring(#payload) }, source = ltn12.source.string(payload), sink = ltn12.sink.table(response) } end)
-        local body = table.concat(response)
-        if not call_ok or not request_ok or tonumber(code) ~= 200 then
-            logger.warn("JPT AI request failed:", tostring(code))
-            self:openChat(mode, self:formatRequestError(code, body, request_ok), display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation)
-            return
-        end
-        local ok, decoded = pcall(json.decode, body)
-        local answer = ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
-        answer = answer or _("JPT AI received no readable response.")
-        if response_heading then answer = response_heading .. "\n\n" .. answer end
-        self:openChat(mode, answer, display_question, chat_dialog, nil, nil, nearby_pages, selected_text, conversation)
-    end)
+    if not context then
+        self:openChat(mode, label, display_question, composer, nil, nil, nearby_pages, selected_text, conversation)
+        return
+    end
+    local response_length = response_lengths[self.response_length] or response_lengths.medium
+    local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
+    local timeout = math.max(20, math.min(600, tonumber(self.config.request_timeout) or 180))
+    local system_prompt = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction
+    local context_prefix = "BOOK CONTEXT (" .. label .. ") — PLAIN TEXT:\n"
+    local conversation_prefix = conversation and "\n\nCONVERSATION SO FAR:\n" or ""
+    local question_prefix = "\n\nQUESTION:\n"
+    local estimated_bytes = #system_prompt + #context_prefix + #context + #conversation_prefix + #(conversation or "") + #question_prefix + #question
+    local function beginRequest()
+        UIManager:nextTick(function()
+            local waiting_dialog = self:openChat(
+                mode,
+                _("(Preparing your answer… may take a moment)"),
+                display_question,
+                composer,
+                nil,
+                nil,
+                nearby_pages,
+                selected_text,
+                conversation
+            )
+            UIManager:forceRePaint()
+            local user_prompt = context_prefix .. context .. conversation_prefix .. (conversation or "") .. question_prefix .. question
+            local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low", messages = {{ role = "system", content = system_prompt }, { role = "user", content = user_prompt }} })
+            https.TIMEOUT = timeout
+            local response = {}
+            local call_ok, request_ok, code = pcall(function()
+                return https.request{
+                    url = connection.base_url,
+                    method = "POST",
+                    headers = {
+                        ["Content-Type"] = "application/json",
+                        ["Authorization"] = "Bearer " .. connection.api_key,
+                        ["Content-Length"] = tostring(#payload),
+                    },
+                    source = ltn12.source.string(payload),
+                    sink = ltn12.sink.table(response),
+                }
+            end)
+            local body = table.concat(response)
+            if not call_ok or not request_ok or tonumber(code) ~= 200 then
+                logger.warn("JPT AI request failed:", tostring(code))
+                self:openChat(mode, self:formatRequestError(code, body, request_ok), display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+                return
+            end
+            local decoded_ok, decoded = pcall(json.decode, body)
+            local answer = decoded_ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
+            if type(answer) ~= "string" or answer == "" then answer = _("JPT AI received no readable response.") end
+            if response_heading then answer = response_heading .. "\n\n" .. answer end
+            self:openChat(mode, answer, display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+        end)
+    end
+    local threshold = math.max(1, tonumber(self.config.context_warning_tokens) or 24000)
+    local estimated_tokens = ContextPolicy.estimateTokensFromBytes(estimated_bytes)
+    if estimated_tokens > threshold then
+        UIManager:show(ConfirmBox:new{
+            text = string.format(_("This request is approximately %d tokens, above the warning level of %d. The estimate is approximate and the full context will be sent to your configured AI service."), estimated_tokens, threshold),
+            ok_text = _("Send anyway"), cancel_text = _("Review context"),
+            ok_callback = beginRequest,
+        })
+    else
+        beginRequest()
+    end
 end
 
 function JPTAI:ask(mode, selected_text)

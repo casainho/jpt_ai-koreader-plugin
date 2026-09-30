@@ -7,5 +7,6 @@ return {
     temperature = 0.2,
     max_output_tokens = 12000,
     request_timeout = 180,
+    context_warning_tokens = 24000,
     reasoning_effort = "low",
 }

@@ -16,6 +16,8 @@ Your reading companion for KOReader: select any word or passage and ask AI for i
 - Remember separate secondary-context choices for questions with and without selected text.
 - Adjust response font size, translation language, and response length from the plugin options. Choose **Short**, **Medium**, **Long**, or **Very long**; the setting is remembered for future questions.
 - Send requests to an AI chat-completions endpoint that you configure yourself.
+- Keep the reader responsive while a request runs, with a local cancel control.
+- Warn before sending context above the configured approximate token threshold.
 
 ## Requirements
 
@@ -49,6 +51,7 @@ return {
     temperature = 0.2,
     max_output_tokens = 12000,
     request_timeout = 180,
+    context_warning_tokens = 24000,
     reasoning_effort = "low",
 }
 ```
@@ -58,6 +61,7 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 ## Using the plugin
 
 - Open **JPT AI** from KOReader's tools menu or bind its `Open JPT AI` action to a gesture.
+- The menu presets have fixed scopes: **minimum** sends the current page, **medium** sends three pages centered on the current page, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context.
 - Select text in a book to open **JPT AI** directly; KOReader's selection menu and dictionary popup are skipped for that selection.
 - The selected text goes directly to JPT AI as its Main context and is prefilled in the question field, ready for you to continue typing. It is sent as context only once and is not repeated in the result header.
 - Use **Translate**, **Summarize**, **Explain**, or **Meaning** for a quick response, or write a custom question.
@@ -88,6 +92,8 @@ For **Translate**, the model uses the language selected under **Options → Tran
 - The plugin remembers separate Secondary-context choices for questions with and without selected text. **Page** is available only with a selection; without one, the Main context already contains the current page.
 - **Meaning** relies on the Secondary context to identify how a selected word or expression is used in the surrounding text. With Secondary context disabled, the model may have only the selected word or expression and therefore less evidence for a context-specific meaning.
 - Every request tells the model to base its answer strictly on the supplied book context, act on the Main context, and use the Secondary context only as supporting material.
+- Requests use KOReader's stable HTTPS path. A waiting message is shown while the reader waits for the response, up to `request_timeout` seconds.
+- Context larger than `context_warning_tokens` triggers a confirmation before sending. The estimate is approximate, and lowering the threshold makes the warning appear sooner. The default is 24,000 estimated tokens.
 
 | Secondary context | Exact content sent |
 | --- | --- |
@@ -108,6 +114,10 @@ The selected text and requested context are sent only to the endpoint configured
 ## Compatibility
 
 This plugin was tested on a **Kobo Clara BW (P365)** running KOReader. It is intended to work on any device that runs KOReader, although other devices and KOReader versions have not yet been tested.
+
+## Developer checks
+
+The context extraction and request-error classification tests are in `tests/test_context_policy.lua`. From the repository root, run `luajit jpt_ai.koplugin/tests/test_context_policy.lua`.
 
 ## Repository contents
 
