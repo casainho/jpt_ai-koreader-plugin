@@ -14,9 +14,10 @@ Your reading companion for KOReader: select any word or passage and ask AI for i
 - Explain, summarize, and translate selected passages with one tap.
 - Pick the primary and secondary reading contexts directly in the question dialog.
 - Remember separate secondary-context choices for questions with and without selected text.
+- Remember the last primary context, page counts, response length, translation language, and answer font size. Use **Ask (last settings)** or the `Open JPT AI` gesture to reopen those choices.
 - Adjust response font size, translation language, and response length from the plugin options. Choose **Short**, **Medium**, **Long**, or **Very long**; the setting is remembered for future questions.
 - Send requests to an AI chat-completions endpoint that you configure yourself.
-- Keep the reader responsive while a request runs, with a local cancel control.
+- Keep the reader responsive while a request runs, show elapsed time, and display streamed answer text when the endpoint supports it. Retry without streaming when the endpoint rejects streaming requests.
 - Warn before sending context above the configured approximate token threshold.
 
 ## Requirements
@@ -60,8 +61,8 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 
 ## Using the plugin
 
-- Open **JPT AI** from KOReader's tools menu or bind its `Open JPT AI` action to a gesture.
-- The menu presets have fixed scopes: **minimum** sends the current page, **medium** sends three pages centered on the current page, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context.
+- Open **JPT AI** from KOReader's tools menu. Choose **Ask (last settings)** to reuse the saved choices, or one of the minimum, medium, and maximum presets for a one-off scope. The `Open JPT AI` gesture also uses the saved choices.
+- The menu presets choose the Main context scope: **minimum** sends the current page, **medium** sends three pages centered on the current page, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context. The Secondary-context button keeps its last choice for the next question, separately for questions with and without selected text.
 - Select text in a book to open **JPT AI** directly; KOReader's selection menu and dictionary popup are skipped for that selection.
 - The selected text goes directly to JPT AI as its Main context and is prefilled in the question field, ready for you to continue typing. It is sent as context only once and is not repeated in the result header.
 - Use **Translate**, **Summarize**, **Explain**, or **Meaning** for a quick response, or write a custom question.
@@ -92,7 +93,7 @@ For **Translate**, the model uses the language selected under **Options → Tran
 - The plugin remembers separate Secondary-context choices for questions with and without selected text. **Page** is available only with a selection; without one, the Main context already contains the current page.
 - **Meaning** relies on the Secondary context to identify how a selected word or expression is used in the surrounding text. With Secondary context disabled, the model may have only the selected word or expression and therefore less evidence for a context-specific meaning.
 - Every request tells the model to base its answer strictly on the supplied book context, act on the Main context, and use the Secondary context only as supporting material.
-- Requests use KOReader's stable HTTPS path. A waiting message is shown while the reader waits for the response, up to `request_timeout` seconds.
+- Requests run in a background worker using KOReader's HTTPS path. The answer dialog updates the elapsed time every five seconds and shows streamed text in batches when the endpoint supports it. **Cancel request** stops the worker. If streaming is rejected, the plugin retries once without streaming; the total wait remains limited by `request_timeout`.
 - Context larger than `context_warning_tokens` triggers a confirmation before sending. The estimate is approximate, and lowering the threshold makes the warning appear sooner. The default is 24,000 estimated tokens.
 
 | Secondary context | Exact content sent |

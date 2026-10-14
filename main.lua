@@ -15,6 +15,8 @@ local Dispatcher = require("dispatcher")
 local UIManager = require("ui/uimanager")
 local FileManagerConverter = require("apps/filemanager/filemanagerconverter")
 local LuaSettings = require("luasettings")
+local ffi = require("ffi")
+local ffiutil = require("ffi/util")
 local ltn12 = require("ltn12")
 local https = require("ssl.https")
 local json = require("json")
@@ -166,7 +168,7 @@ function JPTAI:openSelectedTextComposer(selected)
     local selected_chars = util.splitToChars(selected)
     self.pending_selected_text = selected
     UIManager:nextTick(function()
-        self:openComposer("minimum", nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
+        self:openComposer(nil, nil, nil, nil, selected .. "\n\n", #selected_chars + 2)
     end)
 end
 
@@ -212,13 +214,14 @@ function JPTAI:onDispatcherRegisterActions()
 end
 
 function JPTAI:onJPTAIOpen()
-    self:ask("minimum", self:getSelectedText())
+    self:ask(nil, self:getSelectedText())
 end
 
 function JPTAI:addToMainMenu(menu_items)
     menu_items.jpt_ai = {
         text = _("JPT AI"), sorting_hint = "more_tools",
         sub_item_table = {
+            { text = _("Ask (last settings)"), callback = function() self:ask() end },
             { text = _("Ask (minimum: current page)"), callback = function() self:ask("minimum") end },
             { text = _("Ask (medium: 3 pages)"), callback = function() self:ask("medium") end },
             { text = _("Ask (maximum: complete book)"), callback = function() self:ask("maximum") end },
@@ -597,7 +600,7 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     local preset = ContextPolicy.resolvePreset(mode, has_selection)
     local selected_mode = preset and preset.primary_context or (mode == "chapter" and "chapter" or mode == "book" and "book" or self.primary_context)
     local selected_page_count = preset and preset.primary_page_count or self.primary_page_count
-    local selected_secondary = secondary_mode or (preset and preset.secondary_context) or (has_selection and self.selection_secondary_context or self.secondary_context)
+    local selected_secondary = secondary_mode or (has_selection and self.selection_secondary_context or self.secondary_context) or (preset and preset.secondary_context)
     local conversation = self.pending_conversation
     self.pending_conversation = nil
     local function submitQuestion(asked, action)
@@ -762,7 +765,7 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     if input_expanded then composer:onShowKeyboard() end
 end
 
-function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages, selected_text, conversation)
+function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden, input_text, nearby_pages, selected_text, conversation, is_waiting)
     if previous_dialog then UIManager:close(previous_dialog) end
     input_hidden = true
     if type(response) ~= "string" then response = tostring(response or "") end
@@ -791,7 +794,12 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     dialog = CompactChatDialog:new{
         title = "JPT AI - " .. self:getBookTitle(), input = input_text or "", input_hint = _("Write your question here"),
         fullscreen = true, condensed = true, allow_newline = true, keyboard_visible = false,
-        buttons = {{
+        buttons = is_waiting and {{
+            { text = _("Cancel request"), width = width, callback = function()
+                dialog._jpt_ai_dismissed = true
+                UIManager:close(dialog)
+            end },
+        }} or {{
             { text = _("Back"), width = math.floor(width / 3), callback = function()
                 self.pending_selected_text = selected_text
                 local draft = selected_text and (selected_text .. "\n\n") or nil
@@ -818,6 +826,35 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     }
     output.dialog = dialog
     dialog:addWidget(output)
+    dialog._jpt_ai_update_response = function(next_response)
+        response = next_response
+        local updated_turn = question and ("User:\n" .. question .. "\n\nJPT AI:\n" .. response) or response
+        local updated_markdown = (conversation and conversation .. "\n\n" or "") .. updated_turn
+        local update_ok, updated_html = pcall(renderMarkdown, updated_markdown)
+        if not update_ok or type(updated_html) ~= "string" then
+            updated_html = "<pre>" .. htmlEscape(updated_markdown) .. "</pre>"
+        end
+        local previous_page = output.htmlbox_widget.page_number or 1
+        local follow_tail = previous_page == output.htmlbox_widget.page_count
+        output.htmlbox_widget:free()
+        output.html_body = updated_html
+        output.htmlbox_widget:setContent(updated_html, css, font_size, false, nil, output.html_resource_directory)
+        output.htmlbox_widget.page_number = follow_tail and output.htmlbox_widget.page_count or math.min(previous_page, output.htmlbox_widget.page_count)
+        output.htmlbox_widget.page_boxes = nil
+        output.v_scroll_bar.enable = output.htmlbox_widget.page_count > 1
+        output:_updateScrollBar()
+        output.htmlbox_widget:_render()
+        UIManager:setDirty(dialog, function()
+            return "partial", output.dimen
+        end)
+    end
+    if is_waiting then
+        dialog.onCloseWidget = function(widget)
+            widget._jpt_ai_dismissed = true
+            if widget._jpt_ai_cancel_request then widget._jpt_ai_cancel_request() end
+            return CompactChatDialog.onCloseWidget(widget)
+        end
+    end
     local output_row = dialog._added_widgets and dialog._added_widgets[1]
     for index, widget in ipairs(dialog.vgroup) do
         if widget == output_row then table.remove(dialog.vgroup, index); table.insert(dialog.vgroup, 2, output_row); break end
@@ -867,37 +904,254 @@ function JPTAI:sendQuestion(question, mode, _unused, nearby_pages, display_quest
                 nil,
                 nearby_pages,
                 selected_text,
-                conversation
+                conversation,
+                true
             )
             UIManager:forceRePaint()
             local user_prompt = context_prefix .. context .. conversation_prefix .. (conversation or "") .. question_prefix .. question
-            local payload = json.encode({ model = connection.model, temperature = self.config.temperature or 0.2, max_tokens = math.min(configured_max_tokens, response_length.max_tokens), reasoning_effort = self.config.reasoning_effort or "low", messages = {{ role = "system", content = system_prompt }, { role = "user", content = user_prompt }} })
-            https.TIMEOUT = timeout
-            local response = {}
-            local call_ok, request_ok, code = pcall(function()
-                return https.request{
-                    url = connection.base_url,
-                    method = "POST",
-                    headers = {
-                        ["Content-Type"] = "application/json",
-                        ["Authorization"] = "Bearer " .. connection.api_key,
-                        ["Content-Length"] = tostring(#payload),
-                    },
-                    source = ltn12.source.string(payload),
-                    sink = ltn12.sink.table(response),
-                }
-            end)
-            local body = table.concat(response)
-            if not call_ok or not request_ok or tonumber(code) ~= 200 then
-                logger.warn("JPT AI request failed:", tostring(code))
-                self:openChat(mode, self:formatRequestError(code, body, request_ok), display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
-                return
+            local request_started = os.time()
+            local stream_text = ""
+            local stream_buffer = ""
+            local raw_body = ""
+            local wire_buffer = ""
+            local processed_wire_length = 0
+            local metadata = nil
+            local process_id, read_fd
+            local streaming_enabled = true
+            local fallback_used = false
+            local request_active = true
+            local stream_error = nil
+            local standby_held = true
+            local last_display_time = 0
+            local next_stream_display_length = 300
+            local result_marker = "\0JPTAI_RESULT\0"
+            local poll_request
+            UIManager:preventStandby()
+
+            local function releaseStandby()
+                if standby_held then
+                    standby_held = false
+                    UIManager:allowStandby()
+                end
             end
-            local decoded_ok, decoded = pcall(json.decode, body)
-            local answer = decoded_ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
-            if type(answer) ~= "string" or answer == "" then answer = _("JPT AI received no readable response.") end
-            if response_heading then answer = response_heading .. "\n\n" .. answer end
-            self:openChat(mode, answer, display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+
+            local function cancelRequest()
+                if not request_active then return end
+                request_active = false
+                if poll_request then UIManager:unschedule(poll_request) end
+                if process_id then
+                    local cancelled_pid = process_id
+                    ffiutil.terminateSubProcess(cancelled_pid)
+                    local collect
+                    collect = function()
+                        if not ffiutil.isSubProcessDone(cancelled_pid) then UIManager:scheduleIn(1, collect) end
+                    end
+                    UIManager:scheduleIn(0.25, collect)
+                end
+                if read_fd then ffi.C.close(read_fd); read_fd = nil end
+                releaseStandby()
+            end
+            waiting_dialog._jpt_ai_cancel_request = cancelRequest
+
+            local function showProgress(force, status_override)
+                local elapsed = math.max(0, os.time() - request_started)
+                if not force and (elapsed - last_display_time < 1 or (elapsed - last_display_time < 5 and #stream_text < next_stream_display_length)) then return end
+                last_display_time = elapsed
+                next_stream_display_length = #stream_text + 300
+                local status = status_override or (stream_text == "" and _("Waiting for the model…") or _("Receiving the answer…"))
+                local progress = string.format(_("%s (%d s)"), status, elapsed)
+                local visible_text = stream_text
+                if response_heading then visible_text = response_heading .. "\n\n" .. visible_text end
+                if visible_text ~= "" then progress = progress .. "\n\n" .. visible_text end
+                if waiting_dialog and not waiting_dialog._jpt_ai_dismissed and waiting_dialog._jpt_ai_update_response then
+                    local ok, err = pcall(waiting_dialog._jpt_ai_update_response, progress)
+                    if not ok then logger.warn("JPT AI could not update request feedback:", tostring(err)) end
+                end
+            end
+
+            local function acceptEventData(data)
+                if data == "[DONE]" then return end
+                local ok, event = pcall(json.decode, data)
+                if not ok or type(event) ~= "table" then return end
+                if event.error then
+                    stream_error = type(event.error) == "table" and event.error.message or tostring(event.error)
+                    return
+                end
+                local choice = event.choices and event.choices[1]
+                local delta = choice and (choice.delta or choice.message)
+                local content = delta and delta.content
+                if type(content) == "string" and content ~= "" then stream_text = stream_text .. content end
+            end
+
+            local function consumeStreamChunk(chunk)
+                stream_buffer = stream_buffer .. chunk
+                while true do
+                    local newline = stream_buffer:find("\n", 1, true)
+                    if not newline then break end
+                    local line = stream_buffer:sub(1, newline - 1):gsub("\r$", "")
+                    stream_buffer = stream_buffer:sub(newline + 1)
+                    if line:sub(1, 5) == "data:" then
+                        acceptEventData(line:sub(6):gsub("^%s+", ""))
+                    end
+                end
+            end
+
+            local function startSubprocess(use_streaming)
+                local request_body = {
+                    model = connection.model,
+                    temperature = self.config.temperature or 0.2,
+                    max_tokens = math.min(configured_max_tokens, response_length.max_tokens),
+                    reasoning_effort = self.config.reasoning_effort or "low",
+                    messages = {{ role = "system", content = system_prompt }, { role = "user", content = user_prompt }},
+                }
+                if use_streaming then request_body.stream = true end
+                local payload = json.encode(request_body)
+                -- Keep blocking TLS I/O outside the UI process. The parent drains
+                -- the pipe while this worker forwards response chunks as they arrive.
+                local child_pid, child_read_fd = ffiutil.runInSubProcess(function(_, child_write_fd)
+                    https.TIMEOUT = timeout
+                    local sink = function(chunk)
+                        if chunk then
+                            if not ffiutil.writeToFD(child_write_fd, chunk, false) then
+                                return nil, "Could not forward response data to KOReader."
+                            end
+                        end
+                        return 1
+                    end
+                    local call_ok, request_ok, code, _, status = pcall(function()
+                        return https.request{
+                            url = connection.base_url,
+                            method = "POST",
+                            headers = {
+                                ["Content-Type"] = "application/json",
+                                ["Authorization"] = "Bearer " .. connection.api_key,
+                                ["Content-Length"] = tostring(#payload),
+                            },
+                            source = ltn12.source.string(payload),
+                            sink = sink,
+                        }
+                    end)
+                    local result = json.encode({ call_ok = call_ok, request_ok = request_ok, code = code, status = status })
+                    ffiutil.writeToFD(child_write_fd, result_marker .. result, true)
+                end, true)
+                if not child_pid or child_pid <= 0 then
+                    logger.warn("JPT AI could not start request subprocess:", tostring(child_read_fd))
+                    cancelRequest()
+                    self:openChat(mode, _("Could not start the background request."), display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+                    return false
+                end
+                process_id, read_fd = child_pid, child_read_fd
+                streaming_enabled = use_streaming
+                wire_buffer, raw_body, processed_wire_length, stream_buffer, stream_text, metadata = "", "", 0, "", "", nil
+                stream_error = nil
+                return true
+            end
+
+            if not startSubprocess(true) then return end
+
+            local function readAvailable()
+                local available = ffiutil.getNonBlockingReadSize(read_fd)
+                if not available or available <= 0 then return nil end
+                local buffer = ffi.new("uint8_t[?]", available)
+                local count = tonumber(ffi.C.read(read_fd, buffer, available))
+                if not count or count <= 0 then return nil end
+                return ffi.string(buffer, count)
+            end
+
+            local function receivePipeData(chunk)
+                wire_buffer = wire_buffer .. chunk
+                local marker_at = wire_buffer:find(result_marker, 1, true)
+                -- Retain a possible marker prefix until the next pipe read, so
+                -- metadata split across reads never enters the SSE decoder.
+                local body_end = marker_at and marker_at - 1 or math.max(0, #wire_buffer - #result_marker + 1)
+                local body_chunk = wire_buffer:sub(processed_wire_length + 1, body_end)
+                processed_wire_length = body_end
+                raw_body = wire_buffer:sub(1, body_end)
+                if marker_at then
+                    local result = wire_buffer:sub(marker_at + #result_marker)
+                    local ok, decoded = pcall(json.decode, result)
+                    metadata = ok and type(decoded) == "table" and decoded or nil
+                end
+                if streaming_enabled and body_chunk ~= "" then consumeStreamChunk(body_chunk) end
+            end
+
+            local function finishRequest()
+                if read_fd then
+                    ffiutil.readAllFromFD(read_fd)
+                    read_fd = nil
+                end
+                local code = metadata and tonumber(metadata.code)
+                local unsupported = raw_body:lower():find("stream", 1, true)
+                    and (code == 400 or code == 422)
+                if streaming_enabled and unsupported and not fallback_used then
+                    fallback_used = true
+                    logger.info("JPT AI endpoint rejected streaming; retrying without streaming.")
+                    showProgress(true, _("Streaming is unavailable; retrying without it…"))
+                    if startSubprocess(false) then
+                        UIManager:scheduleIn(0.25, poll_request)
+                    end
+                    return
+                end
+                request_active = false
+                waiting_dialog._jpt_ai_cancel_request = nil
+                releaseStandby()
+                if not metadata or not metadata.call_ok or not metadata.request_ok or code ~= 200 then
+                    logger.warn("JPT AI request failed:", tostring(metadata and metadata.code))
+                    if not (waiting_dialog and waiting_dialog._jpt_ai_dismissed) then
+                        self:openChat(mode, self:formatRequestError(metadata and metadata.code, raw_body, metadata and metadata.request_ok), display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+                    end
+                    return
+                end
+                if stream_buffer:match("%S") then
+                    local last_line = stream_buffer:gsub("\r$", "")
+                    if last_line:sub(1, 5) == "data:" then acceptEventData(last_line:sub(6):gsub("^%s+", "")) end
+                end
+                local answer = stream_text
+                if stream_error then
+                    answer = _("The response stream failed: ") .. stream_error
+                end
+                if answer == "" then
+                    local decoded_ok, decoded = pcall(json.decode, raw_body)
+                    answer = decoded_ok and decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message and decoded.choices[1].message.content
+                end
+                if type(answer) ~= "string" or answer == "" then answer = _("JPT AI received no readable response.") end
+                if response_heading then answer = response_heading .. "\n\n" .. answer end
+                logger.info("JPT AI request completed; streamed:", stream_text ~= "", "elapsed seconds:", os.time() - request_started)
+                if not (waiting_dialog and waiting_dialog._jpt_ai_dismissed) then
+                    self:openChat(mode, answer, display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+                end
+            end
+
+            poll_request = function()
+                if not request_active then return end
+                if os.time() - request_started >= timeout then
+                    cancelRequest()
+                    if not waiting_dialog._jpt_ai_dismissed then
+                        self:openChat(mode, self:formatRequestError("timeout", nil, nil), display_question, waiting_dialog, nil, nil, nearby_pages, selected_text, conversation)
+                    end
+                    return
+                end
+                local ok, chunk = pcall(readAvailable)
+                if ok and chunk then
+                    receivePipeData(chunk)
+                    showProgress(false)
+                elseif not ok then
+                    logger.warn("JPT AI could not read response stream:", tostring(chunk))
+                end
+                local done = ffiutil.isSubProcessDone(process_id)
+                if done then
+                    -- Drain the final bytes after the writer exits, then close the pipe.
+                    local final_chunk = readAvailable()
+                    if final_chunk then receivePipeData(final_chunk) end
+                    finishRequest()
+                    return
+                end
+                showProgress(false)
+                UIManager:scheduleIn(0.25, poll_request)
+            end
+
+            showProgress(true)
+            UIManager:scheduleIn(0.25, poll_request)
         end)
     end
     local threshold = math.max(1, tonumber(self.config.context_warning_tokens) or 24000)
