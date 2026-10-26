@@ -23,6 +23,38 @@ equal(maximum.primary_context, "book", "maximum primary context")
 local selected_maximum = Policy.resolvePreset("maximum", true)
 equal(selected_maximum.secondary_context, "book", "selected maximum secondary context")
 
+equal(Policy.normalizeSecondaryPageCount(3), 4, "migrate old odd count")
+equal(Policy.normalizeSecondaryPageCount(21), 32, "migrate old maximum")
+equal(Policy.normalizeSecondaryPageCount(33), 64, "continue beyond old maximum")
+equal(Policy.normalizeSecondaryPageCount(513), 1024, "continue doubling")
+equal(Policy.normalizeSecondaryPageCount(nil), 1, "missing count")
+for index, count in ipairs(Policy.secondaryPageCounts) do
+    local normalized, selected_index = Policy.normalizeSecondaryPageCount(count)
+    equal(normalized, count, "preserve page count")
+    equal(selected_index, index, "picker index")
+    for _, only_previous in ipairs(count <= 1024 and { false, true } or {}) do
+        local first, last = Policy.secondaryPageRange(2048, 4096, count, only_previous)
+        equal(last - first + 1, count, "exact total in both modes")
+        assert(first <= 2048 and last >= 2048, "include current page")
+        if only_previous then equal(last, 2048, "exclude following pages") end
+    end
+end
+local first, last = Policy.secondaryPageRange(50, 100, 4, false)
+equal(first, 48, "even total starts before current page")
+equal(last, 51, "even total ends after current page")
+first, last = Policy.secondaryPageRange(1, 100, 8, true)
+equal(first, 1, "previous pages clamp at book start")
+equal(last, 1, "no following pages at book start")
+first, last = Policy.secondaryPageRange(100, 100, 8, false)
+equal(first, 96, "centered range at book end")
+equal(last, 100, "centered range clamps at book end")
+
+local primary_first, primary_last = Policy.primaryPageRange(50, 100, 5)
+equal(primary_first, 48, "original primary start")
+equal(primary_last, 52, "original primary end")
+equal(Policy.normalizePrimaryPageCount(4), 3, "restore odd primary count")
+equal(Policy.normalizePrimaryPageCount(64), 21, "restore primary maximum")
+
 equal(Policy.estimateTokens(""), 0, "empty estimate")
 equal(Policy.estimateTokens("1234"), 2, "byte estimate rounds up")
 equal(Policy.estimateTokensFromBytes(7), 3, "length estimate rounds up")

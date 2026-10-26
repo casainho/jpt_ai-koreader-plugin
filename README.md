@@ -14,8 +14,8 @@ Your reading companion for KOReader: select any word or passage and ask AI for i
 - Explain, summarize, and translate selected passages with one tap.
 - Pick the primary and secondary reading contexts directly in the question dialog.
 - Remember separate secondary-context choices for questions with and without selected text.
-- Remember the last primary context, page counts, response length, translation language, and answer font size. Use **Ask (last settings)** or the `Open JPT AI` gesture to reopen those choices.
-- Adjust response font size, translation language, and response length from the plugin options. Choose **Short**, **Medium**, **Long**, or **Very long**; the setting is remembered for future questions.
+- Remember the last primary context, page counts, secondary **Only previous pages** choice, response length, translation language, and answer font size. Use **Ask (last settings)** or the `Open JPT AI` gesture to reopen those choices.
+- Adjust response font size, translation language, and response length from the plugin options. Choose **Short**, **Medium**, **Long**, or **Very long**. A changed length is saved for the next **Translate**, **Summarize**, **Explain**, or **Meaning** action you choose. Each action then reuses its own saved length until you change it again. Existing installations start each action with the previously saved length.
 - Send requests to an AI chat-completions endpoint that you configure yourself.
 - Keep the reader responsive while a request runs, show elapsed time, and display streamed answer text when the endpoint supports it. Retry without streaming when the endpoint rejects streaming requests.
 - Warn before sending context above the configured approximate token threshold.
@@ -62,14 +62,14 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 ## Using the plugin
 
 - Open **JPT AI** from KOReader's tools menu. Choose **Ask (last settings)** to reuse the saved choices, or one of the minimum, medium, and maximum presets for a one-off scope. The `Open JPT AI` gesture also uses the saved choices.
-- The menu presets choose the Main context scope: **minimum** sends the current page, **medium** sends three pages centered on the current page, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context. The Secondary-context button keeps its last choice for the next question, separately for questions with and without selected text.
+- The menu presets choose the Main context scope: **minimum** sends the current page, **medium** sends three centered pages, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context. The Secondary-context button keeps its last choice for the next question, separately for questions with and without selected text.
 - Select text in a book to open **JPT AI** directly; KOReader's selection menu and dictionary popup are skipped for that selection.
 - The selected text goes directly to JPT AI as its Main context and is prefilled in the question field, ready for you to continue typing. It is sent as context only once and is not repeated in the result header.
 - Use **Translate**, **Summarize**, **Explain**, or **Meaning** for a quick response, or write a custom question.
-- Without selected text, use **MAIN CONTEXT** to choose primary pages, the current chapter, or the complete book. Primary **Pages (n)** uses an odd total: 1, 3, 5, and so on.
+- Without selected text, use **MAIN CONTEXT** to choose primary pages, the current chapter, or the complete book. Primary **Pages (n)** uses the original odd totals from 1 to 21, centered on the current page. Secondary **Pages (n)** offers 1, 2, 4, 8, 16, 32, 64, 128, and so on, both with and without selected text. Its **Only previous pages** checkbox includes the current page and up to n-1 preceding pages. When unchecked, secondary pages surround the current page, with one extra preceding page for even totals. Ranges stop at book boundaries. **Apply** saves the secondary count and checkbox; counts are remembered separately for questions with and without selected text, while the checkbox is shared. Existing secondary radii migrate to total counts; the previous primary checkbox choice moves to secondary context. Primary counts are restored to odd totals within 1 to 21.
 - With selected text, the selection is shown as the fixed **MAIN CONTEXT**.
-- With selected text, the single **SECONDARY CONTEXT** row contains **None**, **Page**, **Pages ±N**, **Chapter**, and **Book**.
-- Without selected text, the same compact row contains **None**, **Pages ±N**, **Chapter**, and **Book**. **Page** is omitted because the Main context already contains the current page.
+- The **SECONDARY CONTEXT** row contains **None**, **Pages (n)**, **Chapter**, and **Book**, with or without selected text. Choose **Pages (1)** for only the current page. Existing **Page** choices migrate to **Pages (1)**.
+- The secondary page-range heading marks the current page: `214 - 245 (current page)` for preceding pages, or `243 - 245 (current page) - 247` when the range extends in both directions.
 - Tapping **Pages ±N** selects it immediately. Closing the number selector without changing N keeps **Pages ±N** selected.
 
 ### Quick-action labels
@@ -118,7 +118,7 @@ This plugin was tested on a **Kobo Clara BW (P365)** running KOReader. It is int
 
 ## Developer checks
 
-The context extraction and request-error classification tests are in `tests/test_context_policy.lua`. From the repository root, run `luajit jpt_ai.koplugin/tests/test_context_policy.lua`.
+From the plugin repository root, run `luajit tests/test_context_policy.lua` for context extraction and request-error classification. Run `luajit tests/test_response_lengths.lua` for action-specific response lengths, migration, and preference reload using KOReader UI/settings stubs.
 
 ## Repository contents
 

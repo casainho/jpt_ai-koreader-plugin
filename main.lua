@@ -7,6 +7,7 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local SpinWidget = require("ui/widget/spinwidget")
+local CheckButton = require("ui/widget/checkbutton")
 local Font = require("ui/font")
 local TitleBar = require("ui/widget/titlebar")
 local Device = require("device")
@@ -36,6 +37,8 @@ local response_lengths = {
     long = { label = _("Long"), max_tokens = 7500, instruction = "Give a detailed, thorough answer. Develop the reasoning and include useful examples or structure when appropriate." },
     very_long = { label = _("Very long"), max_tokens = 12000, instruction = "Give a very detailed and comprehensive answer. Cover the relevant nuances, reasoning, and examples; do not unnecessarily abbreviate the response." },
 }
+
+local response_length_actions = { "translate", "summarize", "explain", "meaning" }
 
 -- InputDialog does not expose title-bar styling. Keep this scoped to the chat
 -- dialog, including any later reinitialization caused by a screen rotation.
@@ -140,10 +143,30 @@ function JPTAI:init()
     self.translation_language = self.question_history_settings:readSetting("translation_language", "Portuguese (Portugal)")
     self.response_length = self.question_history_settings:readSetting("response_length", "medium")
     if not response_lengths[self.response_length] then self.response_length = "medium" end
+    local saved_lengths = self.question_history_settings:readSetting("action_response_lengths", {})
+    if type(saved_lengths) ~= "table" then saved_lengths = {} end
+    self.action_response_lengths = {}
+    local lengths_changed = false
+    for _, action in ipairs(response_length_actions) do
+        local length = saved_lengths[action]
+        if not response_lengths[length] then
+            length = self.response_length
+            lengths_changed = true
+        end
+        self.action_response_lengths[action] = length
+    end
+    if lengths_changed then
+        self.question_history_settings:saveSetting("action_response_lengths", self.action_response_lengths):flush()
+    end
+    self.pending_response_length = nil
     self.primary_context = self.question_history_settings:readSetting("primary_context", "pages")
     self.secondary_context = self.question_history_settings:readSetting("secondary_context", "chapter")
     local legacy_radius = self.question_history_settings:readSetting("page_radius", 1)
-    self.primary_page_count = math.max(1, tonumber(self.question_history_settings:readSetting("primary_page_count", 1)) or 1)
+    self.primary_page_count = ContextPolicy.normalizePrimaryPageCount(self.question_history_settings:readSetting("primary_page_count", 1))
+    self.question_history_settings:saveSetting("primary_page_count", self.primary_page_count):flush()
+    self.secondary_only_previous_pages = self.question_history_settings:readSetting("secondary_only_previous_pages",
+        self.question_history_settings:readSetting("primary_only_previous_pages", false)) == true
+    self.question_history_settings:saveSetting("secondary_only_previous_pages", self.secondary_only_previous_pages):flush()
     self.secondary_page_radius = math.max(0, tonumber(self.question_history_settings:readSetting("secondary_page_radius", legacy_radius)) or 1)
     if self.secondary_context == "pages" then
         self.secondary_context = self.secondary_page_radius > 0 and "nearby_pages" or "none"
@@ -157,6 +180,17 @@ function JPTAI:init()
         self.selection_secondary_context = "none"
     end
     self.selection_secondary_page_radius = math.max(1, tonumber(self.question_history_settings:readSetting("selection_secondary_page_radius", 1)) or 1)
+    self.secondary_page_count = ContextPolicy.normalizeSecondaryPageCount(self.question_history_settings:readSetting(
+        "secondary_page_count", 2 * self.secondary_page_radius + 1))
+    self.selection_secondary_page_count = ContextPolicy.normalizeSecondaryPageCount(self.question_history_settings:readSetting(
+        "selection_secondary_page_count", 2 * self.selection_secondary_page_radius + 1))
+    if self.selection_secondary_context == "current_page" then
+        self.selection_secondary_context = "nearby_pages"
+        self.selection_secondary_page_count = 1
+        self.question_history_settings:saveSetting("selection_secondary_context", self.selection_secondary_context)
+    end
+    self.question_history_settings:saveSetting("secondary_page_count", self.secondary_page_count)
+        :saveSetting("selection_secondary_page_count", self.selection_secondary_page_count):flush()
     self.active_request = nil
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
@@ -381,6 +415,8 @@ function JPTAI:getContext(primary_mode, secondary_mode, primary_page_count)
             return ContextPolicy.getPageTextRange(document, total, first, last)
         end
         local current = document.info.has_pages and (self.ui.view and self.ui.view.state.page or 1) or document:getPageFromXPointer(document:getXPointer())
+        local primary_first, primary_last = ContextPolicy.primaryPageRange(current, total,
+            primary_page_count or self.primary_page_count)
         local function contextPart(mode, radius, is_secondary)
             if mode == "book" then
                 local heading = "[Context: Complete book]"
@@ -417,25 +453,30 @@ function JPTAI:getContext(primary_mode, secondary_mode, primary_page_count)
                 return "[Context: Current page -- " .. current .. "]", getPageRange(current, current)
             end
             if is_secondary and mode == "nearby_pages" then
-                local first, last = math.max(1, current - radius), math.min(total, current + radius)
-                return "[Context: Nearby pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
+                local first, last = ContextPolicy.secondaryPageRange(current, total, radius, self.secondary_only_previous_pages)
+                local range = current .. " (current page)"
+                if first < current then range = first .. " - " .. range end
+                if last > current then range = range .. " - " .. last end
+                return "[Context: " .. range .. "]", getPageRange(first, last)
             end
             if is_secondary and primary_mode == "pages" and not (selected and selected:match("%S")) then
-                local primary_radius = math.floor(((primary_page_count or self.primary_page_count) - 1) / 2)
-                local before = getPageRange(math.max(1, current - primary_radius - radius), current - primary_radius - 1)
-                local after = getPageRange(current + primary_radius + 1, math.min(total, current + primary_radius + radius))
+                local before = getPageRange(math.max(1, primary_first - radius), primary_first - 1)
+                local after = getPageRange(primary_last + 1, math.min(total, primary_last + radius))
                 local additional = before ~= "" and after ~= "" and (before .. "\n\n" .. after) or (before ~= "" and before or after)
-                return "[Context: Additional pages -- " .. math.max(1, current - primary_radius - radius) .. "-" .. math.min(total, current + primary_radius + radius) .. "]", additional
+                return "[Context: Additional pages -- " .. math.max(1, primary_first - radius) .. "-" .. math.min(total, primary_last + radius) .. "]", additional
+            end
+            if not is_secondary then
+                return "[Context: Pages -- " .. primary_first .. "-" .. primary_last .. "]", getPageRange(primary_first, primary_last)
             end
             local first, last = math.max(1, current - radius), math.min(total, current + radius)
             return "[Context: Pages -- " .. first .. "-" .. last .. "]", getPageRange(first, last)
         end
         local primary_heading, primary_text, primary_error
-        if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, math.floor(((primary_page_count or self.primary_page_count) - 1) / 2), false) end
+        if selected and selected:match("%S") then primary_heading, primary_text = "[Context: Selected text]", selected else primary_heading, primary_text, primary_error = contextPart(primary_mode, nil, false) end
         if primary_error then return nil, primary_error end
         local secondary_heading, secondary_text, secondary_error
         if secondary_mode and secondary_mode ~= "none" then
-            local secondary_radius = selected and selected:match("%S") and self.selection_secondary_page_radius or self.secondary_page_radius
+            local secondary_radius = selected and selected:match("%S") and self.selection_secondary_page_count or self.secondary_page_count
             secondary_heading, secondary_text, secondary_error = contextPart(secondary_mode, secondary_radius, true)
             if secondary_error then return nil, secondary_error end
         end
@@ -468,7 +509,20 @@ end
 function JPTAI:setResponseLength(length)
     if not response_lengths[length] then return end
     self.response_length = length
+    self.pending_response_length = length
     self.question_history_settings:saveSetting("response_length", length):flush()
+end
+
+function JPTAI:resolveResponseLength(action)
+    local length = self.pending_response_length
+        or (action and self.action_response_lengths[action]) or self.response_length
+    self.pending_response_length = nil
+    if action then
+        self.action_response_lengths[action] = length
+        self.question_history_settings:saveSetting("action_response_lengths", self.action_response_lengths):flush()
+    end
+    self.response_length = length
+    return length
 end
 
 function JPTAI:setContext(kind, mode)
@@ -486,9 +540,15 @@ function JPTAI:setSelectionSecondaryPageRadius(value)
     self.question_history_settings:saveSetting("selection_secondary_page_radius", self.selection_secondary_page_radius):flush()
 end
 
+function JPTAI:setSecondaryPageCount(value, for_selection)
+    local key = for_selection and "selection_secondary_page_count" or "secondary_page_count"
+    self[key] = ContextPolicy.normalizeSecondaryPageCount(value)
+    self.question_history_settings:saveSetting(key, self[key]):flush()
+end
+
 function JPTAI:setPageRadius(kind, value)
     if kind == "primary" then
-        self.primary_page_count = math.max(1, math.floor(tonumber(value) or 1))
+        self.primary_page_count = ContextPolicy.normalizePrimaryPageCount(value)
         self.question_history_settings:saveSetting("primary_page_count", self.primary_page_count):flush()
         return
     end
@@ -603,7 +663,7 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     local selected_secondary = secondary_mode or (has_selection and self.selection_secondary_context or self.secondary_context) or (preset and preset.secondary_context)
     local conversation = self.pending_conversation
     self.pending_conversation = nil
-    local function submitQuestion(asked, action)
+    local function submitQuestion(asked, action, action_key)
         if asked and asked:match("%S") then
             local question_for_model = asked
             if not action and has_selection and asked:sub(1, #selected) == selected then
@@ -616,7 +676,8 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
             elseif has_selection then
                 display_question = selected .. "\n\n" .. question_for_model
             end
-            self:sendQuestion(question_for_model, selected_mode, nil, selected_secondary, display_question, selected, conversation, selected_page_count, composer)
+            local length = self:resolveResponseLength(action_key)
+            self:sendQuestion(question_for_model, selected_mode, nil, selected_secondary, display_question, selected, conversation, selected_page_count, composer, length)
         end
     end
     local input_action_button
@@ -643,10 +704,10 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         condensed = true, allow_newline = true,
         buttons = {
             {
-                { text = _("Translate"), callback = function() submitQuestion("Translate the Main context into " .. self.translation_language .. ", preserving its meaning and tone. Use the Secondary context to resolve ambiguity, but do not translate the Secondary context.", _("Translate")) end },
-                { text = _("Summarize"), callback = function() submitQuestion("Summarize the Main context, preserving its main ideas and important details. Use the Secondary context only to interpret the Main context correctly.", _("Summarize")) end },
-                { text = _("Explain"), callback = function() submitQuestion("Explain the Main context clearly. Use the Secondary context only when it helps clarify the explanation. Use examples when helpful.", _("Explain")) end },
-                { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning")) end },
+                { text = _("Translate"), callback = function() submitQuestion("Translate the Main context into " .. self.translation_language .. ", preserving its meaning and tone. Use the Secondary context to resolve ambiguity, but do not translate the Secondary context.", _("Translate"), "translate") end },
+                { text = _("Summarize"), callback = function() submitQuestion("Summarize the Main context, preserving its main ideas and important details. Use the Secondary context only to interpret the Main context correctly.", _("Summarize"), "summarize") end },
+                { text = _("Explain"), callback = function() submitQuestion("Explain the Main context clearly. Use the Secondary context only when it helps clarify the explanation. Use examples when helpful.", _("Explain"), "explain") end },
+                { text = _("Meaning"), callback = function() submitQuestion("Explain the specific meaning of the word or expression in the Main context. Use the Secondary context to determine how it is being used, then give examples that use it with the same meaning.", _("Meaning"), "meaning") end },
             },
             {
                 { text = _("Close"), id = "close", callback = function()
@@ -712,10 +773,7 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
         local context_row = {
             { text = (current == "none" and "✓ " or "") .. _("None"), font_size = compact_font_size, callback = function() chooseSecondary("none", for_selection) end },
         }
-        if for_selection then
-            table.insert(context_row, { text = (current == "current_page" and "✓ " or "") .. _("Page"), font_size = compact_font_size, callback = function() chooseSecondary("current_page", true) end })
-        end
-        table.insert(context_row, { text = (current == "nearby_pages" and "✓ " or "") .. string.format(_("Pages ±%d"), radius), font_size = compact_font_size, callback = function()
+        table.insert(context_row, { text = (current == "nearby_pages" and "✓ " or "") .. string.format(_("Pages (%d)"), radius), font_size = compact_font_size, callback = function()
                 local draft, cursor = composer:getInputText(), composer._input_widget.charpos
                 if for_selection then
                     self:setSelectionSecondaryContext("nearby_pages")
@@ -723,22 +781,34 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
                     self:setContext("secondary", "nearby_pages")
                 end
                 UIManager:close(composer)
-                UIManager:show(SpinWidget:new{
-                    title_text = _("Nearby pages on each side"),
-                    info_text = _("Includes the current page and this many pages before and after it."),
-                    value = radius, value_min = 1, value_max = 20, value_step = 1, value_hold_step = 1, precision = "%d",
+                local page_count, page_count_index = ContextPolicy.normalizeSecondaryPageCount(radius)
+                local previous_pages_checkbox
+                local pages_dialog = SpinWidget:new{
+                    title_text = _("Pages in the secondary context"),
+                    info_text = _("Choose how many pages to include in the secondary context, including the current page."),
+                    value_table = ContextPolicy.secondaryPageCounts, value_index = page_count_index,
+                    value_step = 1, value_hold_step = 1, precision = "%.0f", ok_always_enabled = true,
                     callback = function(spin)
+                        self.secondary_only_previous_pages = previous_pages_checkbox.checked
+                        self.question_history_settings:saveSetting("secondary_only_previous_pages", self.secondary_only_previous_pages):flush()
                         if for_selection then
-                            self:setSelectionSecondaryPageRadius(spin.value)
+                            self:setSecondaryPageCount(spin.value, true)
                         else
-                            self:setPageRadius("secondary", spin.value)
+                            self:setSecondaryPageCount(spin.value, false)
                         end
                     end,
                     close_callback = function()
                         local choice = for_selection and self.selection_secondary_context or self.secondary_context
                         self:openComposer(nil, response, question, chat_dialog, draft, cursor, choice, input_expanded)
                     end,
-                })
+                }
+                previous_pages_checkbox = CheckButton:new{
+                    text = _("Only previous pages"),
+                    checked = self.secondary_only_previous_pages,
+                    parent = pages_dialog,
+                }
+                pages_dialog:addWidget(previous_pages_checkbox)
+                UIManager:show(pages_dialog)
             end })
         table.insert(context_row, { text = (current == "chapter" and "✓ " or "") .. _("Chapter"), font_size = compact_font_size, callback = function() chooseSecondary("chapter", for_selection) end })
         table.insert(context_row, { text = (current == "book" and "✓ " or "") .. _("Book"), font_size = compact_font_size, callback = function() chooseSecondary("book", for_selection) end })
@@ -749,10 +819,10 @@ function JPTAI:openComposer(mode, response, question, chat_dialog, input_text, c
     end
     if has_selection then
         addSelectedMainContext()
-        addSecondaryContextButtons(selected_secondary, self.selection_secondary_page_radius, true)
+        addSecondaryContextButtons(selected_secondary, self.selection_secondary_page_count, true)
     else
         addPrimaryContextButtons()
-        addSecondaryContextButtons(selected_secondary, self.secondary_page_radius, false)
+        addSecondaryContextButtons(selected_secondary, self.secondary_page_count, false)
     end
     if not input_expanded then
         -- The collapsed composer is for quick actions only. Keep the input
@@ -871,7 +941,7 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
     return dialog
 end
 
-function JPTAI:sendQuestion(question, mode, _unused, nearby_pages, display_question, selected_text, conversation, primary_page_count, composer)
+function JPTAI:sendQuestion(question, mode, _unused, nearby_pages, display_question, selected_text, conversation, primary_page_count, composer, length)
     display_question = display_question or question
     local connection, error_message = self:loadConnection()
     if not connection then
@@ -885,7 +955,7 @@ function JPTAI:sendQuestion(question, mode, _unused, nearby_pages, display_quest
         self:openChat(mode, label, display_question, composer, nil, nil, nearby_pages, selected_text, conversation)
         return
     end
-    local response_length = response_lengths[self.response_length] or response_lengths.medium
+    local response_length = response_lengths[length or self.response_length] or response_lengths.medium
     local configured_max_tokens = tonumber(self.config.max_output_tokens) or 12000
     local timeout = math.max(20, math.min(600, tonumber(self.config.request_timeout) or 180))
     local system_prompt = "Answer in the same language as the question. Base your answer strictly on the supplied book context. Treat the Main context as the content the user wants you to act on. Use the Secondary context only as supporting book context. " .. response_length.instruction

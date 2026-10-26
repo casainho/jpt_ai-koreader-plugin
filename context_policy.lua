@@ -1,5 +1,39 @@
 local Policy = {}
 
+-- Offer powers of two throughout Lua's exact integer range, without a small
+-- fixed UI cap. A document boundary still limits the extracted page range.
+Policy.secondaryPageCounts = {}
+for exponent = 0, 52 do
+    Policy.secondaryPageCounts[#Policy.secondaryPageCounts + 1] = 2 ^ exponent
+end
+
+function Policy.normalizeSecondaryPageCount(value)
+    value = tonumber(value) or 1
+    for index, count in ipairs(Policy.secondaryPageCounts) do
+        if value <= count then return count, index end
+    end
+    return Policy.secondaryPageCounts[#Policy.secondaryPageCounts], #Policy.secondaryPageCounts
+end
+
+-- Include the current page. For even totals, prefer one more page behind it.
+function Policy.secondaryPageRange(current, total, count, only_previous)
+    count = Policy.normalizeSecondaryPageCount(count)
+    local before = only_previous and (count - 1) or math.floor(count / 2)
+    local after = count - before - 1
+    return math.max(1, current - before), math.min(total, current + after)
+end
+
+-- Preserve the original odd, centered primary-page selector (1..21).
+function Policy.normalizePrimaryPageCount(value)
+    local count = math.max(1, math.min(21, math.floor(tonumber(value) or 1)))
+    return count % 2 == 0 and count - 1 or count
+end
+
+function Policy.primaryPageRange(current, total, count)
+    local radius = math.floor((Policy.normalizePrimaryPageCount(count) - 1) / 2)
+    return math.max(1, current - radius), math.min(total, current + radius)
+end
+
 -- This estimate is intentionally conservative and is used only to warn. It is
 -- not a tokenizer and must never be presented as an exact provider count.
 function Policy.estimateTokens(text)
