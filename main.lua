@@ -904,12 +904,10 @@ function JPTAI:openChat(mode, response, question, previous_dialog, input_hidden,
         if not update_ok or type(updated_html) ~= "string" then
             updated_html = "<pre>" .. htmlEscape(updated_markdown) .. "</pre>"
         end
-        local previous_page = output.htmlbox_widget.page_number or 1
-        local follow_tail = previous_page == output.htmlbox_widget.page_count
         output.htmlbox_widget:free()
         output.html_body = updated_html
         output.htmlbox_widget:setContent(updated_html, css, font_size, false, nil, output.html_resource_directory)
-        output.htmlbox_widget.page_number = follow_tail and output.htmlbox_widget.page_count or math.min(previous_page, output.htmlbox_widget.page_count)
+        output.htmlbox_widget.page_number = 1
         output.htmlbox_widget.page_boxes = nil
         output.v_scroll_bar.enable = output.htmlbox_widget.page_count > 1
         output:_updateScrollBar()

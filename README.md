@@ -2,6 +2,8 @@
 
 Your reading companion for KOReader: select any word or passage and ask AI for its meaning, an explanation, a summary, a translation, or a discussion in the context of the book.
 
+Functional specification and rules (Portuguese): [ESPECIFICACAO.md](ESPECIFICACAO.md).
+
 <p align="center">
   <img src="plugin_01.jpg" alt="JPT AI question composer in KOReader" height="450" />
   <img src="plugin_02.jpg" alt="JPT AI answer displayed in KOReader" height="450" />
@@ -62,7 +64,7 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 ## Using the plugin
 
 - Open **JPT AI** from KOReader's tools menu. Choose **Ask (last settings)** to reuse the saved choices, or one of the minimum, medium, and maximum presets for a one-off scope. The `Open JPT AI` gesture also uses the saved choices.
-- The menu presets choose the Main context scope: **minimum** sends the current page, **medium** sends three centered pages, and **maximum** sends the whole book. With selected text, minimum sends only the selection, medium adds nearby pages as supporting context, and maximum adds the complete book as supporting context. The Secondary-context button keeps its last choice for the next question, separately for questions with and without selected text.
+- The menu presets choose the Main context scope: **minimum** uses the current page, **medium** uses three centered pages, and **maximum** uses the whole book. With selected text, the selection remains the Main context. In the current implementation, the saved Secondary-context choice takes precedence over the preset's secondary scope, separately for questions with and without selected text; see the specification for details.
 - Select text in a book to open **JPT AI** directly; KOReader's selection menu and dictionary popup are skipped for that selection.
 - The selected text goes directly to JPT AI as its Main context and is prefilled in the question field, ready for you to continue typing. It is sent as context only once and is not repeated in the result header.
 - Use **Translate**, **Summarize**, **Explain**, or **Meaning** for a quick response, or write a custom question.
@@ -70,7 +72,7 @@ Use the URL required by your AI provider. Never commit `jpt_ai_config.lua` or sh
 - With selected text, the selection is shown as the fixed **MAIN CONTEXT**.
 - The **SECONDARY CONTEXT** row contains **None**, **Pages (n)**, **Chapter**, and **Book**, with or without selected text. Choose **Pages (1)** for only the current page. Existing **Page** choices migrate to **Pages (1)**.
 - The secondary page-range heading marks the current page: `214 - 245 (current page)` for preceding pages, or `243 - 245 (current page) - 247` when the range extends in both directions.
-- Tapping **Pages ±N** selects it immediately. Closing the number selector without changing N keeps **Pages ±N** selected.
+- Tapping **Pages (n)** selects it immediately. Closing the number selector without applying changes keeps **Pages (n)** selected and retains the saved count and checkbox.
 
 ### Quick-action labels
 
@@ -83,24 +85,24 @@ The detailed instructions sent to the configured model remain hidden. The answer
 | **Explain** | `Explain: <selected text>` | `Explain: current page (<page number>)` | `Explain: current chapter (<chapter>)` | `Explain: current book - <book name>` |
 | **Meaning** | `Meaning: <selected text>` | `Meaning: current page (<page number>)` | `Meaning: current chapter (<chapter>)` | `Meaning: current book - <book name>` |
 
-For **Translate**, the model uses the language selected under **Options → Translation language**. The selected **Response length** controls the expected amount of detail and the maximum output-token allowance for every action; the quick actions do not impose their own response length.
+For **Translate**, the model uses the language selected under **Options → Translation language**. Each quick action remembers its own **Response length**, which controls the expected detail and maximum output-token allowance. A newly chosen length applies to the next action submitted.
 
 ### How Main and Secondary context are used
 
 - **Main context** is the content the model must act on. When text is selected, the selection becomes the Main context. Otherwise, the chosen primary pages, chapter, or complete book become the Main context.
 - With selected text, **MAIN CONTEXT** shows **Selected text** as a fixed status instead of showing irrelevant page, chapter, and book controls.
 - **Secondary context** is optional supporting book text. It helps the model interpret the Main context, but it is not itself the content to explain, summarize, or translate.
-- The plugin remembers separate Secondary-context choices for questions with and without selected text. **Page** is available only with a selection; without one, the Main context already contains the current page.
+- The plugin remembers separate Secondary-context choices and page counts for questions with and without selected text. **Pages (1)** includes only the current page in either case.
 - **Meaning** relies on the Secondary context to identify how a selected word or expression is used in the surrounding text. With Secondary context disabled, the model may have only the selected word or expression and therefore less evidence for a context-specific meaning.
 - Every request tells the model to base its answer strictly on the supplied book context, act on the Main context, and use the Secondary context only as supporting material.
 - Requests run in a background worker using KOReader's HTTPS path. The answer dialog updates the elapsed time every five seconds and shows streamed text in batches when the endpoint supports it. **Cancel request** stops the worker. If streaming is rejected, the plugin retries once without streaming; the total wait remains limited by `request_timeout`.
+- Each streamed display update keeps the answer on page 1, without following the last page as content grows. The completed answer also opens at the beginning.
 - Context larger than `context_warning_tokens` triggers a confirmation before sending. The estimate is approximate, and lowering the threshold makes the warning appear sooner. The default is 24,000 estimated tokens.
 
 | Secondary context | Exact content sent |
 | --- | --- |
 | **None** | No secondary text |
-| **Page** | The complete current page; available only when text is selected |
-| **Pages ±N** | The current page plus exactly N pages before and N pages after it, limited by the start and end of the book |
+| **Pages (n)** | Up to n pages including the current page: preceding pages only when **Only previous pages** is checked, otherwise surrounding pages; limited by the book boundaries |
 | **Chapter** | The complete current chapter |
 | **Book** | The complete current book |
 
